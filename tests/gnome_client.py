@@ -23,13 +23,16 @@ enter_count = 0
 
 def emit(name, *args):
     connection.emit_signal(None, OBJECT_PATH, INTERFACE, name,
-                           GLib.Variant("(" + "s" * len(args) + ")", args))
+                           GLib.Variant("(d)" if name == "SilenceChanged" else "(" + "s" * len(args) + ")", args))
 
 
 def call(conn, sender, path, interface, method, args, invocation):
     global state, toggle_count
     if method == "GetState":
         invocation.return_value(GLib.Variant("(ss)", (state, "streaming" if state != "idle" else "")))
+        return
+    if method == "GetSilence":
+        invocation.return_value(GLib.Variant("(d)", (0.0,)))
         return
     if method == "Toggle":
         toggle_count += 1

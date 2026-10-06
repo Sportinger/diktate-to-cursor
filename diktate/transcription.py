@@ -8,6 +8,7 @@ import logging
 import math
 import struct
 import threading
+import time
 import wave
 from dataclasses import dataclass
 from urllib.parse import urlencode
@@ -24,6 +25,7 @@ BYTES_PER_SECOND = SAMPLE_RATE * 2
 FRAME_BYTES = 3200  # 100 ms, mono PCM16
 MAX_RECORDING_BYTES = BYTES_PER_SECOND * 60 * 30
 LIVE_FLUSH_BYTES = BYTES_PER_SECOND * 2
+AUTO_STOP_SECONDS = 30
 logger = logging.getLogger(__name__)
 
 
@@ -85,6 +87,8 @@ class Session:
         self.commands = DictationCommands()
         self.transport = "chunks" if config.mode == "chunks" else "streaming"
         self.chunk_words = []
+        self.last_speech_at = time.monotonic()
+        self.last_speech_audio_end = -1.0
 
     def stop(self):
         self.stop_requested.set()
@@ -119,7 +123,10 @@ class Session:
     async def _run(self):
         self.loop = asyncio.get_running_loop()
         self.changed = asyncio.Event()
+        self.last_speech_at = time.monotonic()
+        self.emit("SilenceChanged", 0.0)
         capture = asyncio.create_task(self._capture())
+        silence_watch = asyncio.create_task(self._watch_silence())
         try:
             if self.config.mode == "chunks":
                 self.emit("StateChanged", "recording", "chunks")
@@ -142,6 +149,8 @@ class Session:
             if self.capture_error:
                 raise self.capture_error
         finally:
+            silence_watch.cancel()
+            await asyncio.gather(silence_watch, return_exceptions=True)
             self.stop_requested.set()
             self._terminate_capture()
             try:
@@ -153,6 +162,38 @@ class Session:
                 capture.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await capture
+
+    def silence_seconds(self):
+        return max(0.0, time.monotonic() - self.last_speech_at)
+
+    def _mark_speech(self, audio_time=None):
+        now = time.monotonic()
+        if audio_time is None:
+            spoken_at = now
+        else:
+            if audio_time <= self.last_speech_audio_end:
+                return
+            self.last_speech_audio_end = audio_time
+            spoken_at = now - max(0.0, len(self.audio) / BYTES_PER_SECOND - audio_time)
+        if spoken_at > self.last_speech_at:
+            self.last_speech_at = spoken_at
+            self.emit("SilenceChanged", max(0.0, now - spoken_at))
+
+    def _mark_transcript_speech(self, text, words):
+        if text.strip():
+            ends = [word["end"] for word in words if "end" in word]
+            self._mark_speech(max(ends) if ends else None)
+
+    async def _watch_silence(self):
+        while not self.ended and not self.stop_requested.is_set():
+            silence = self.silence_seconds()
+            self.emit("SilenceChanged", silence)
+            if silence >= AUTO_STOP_SECONDS:
+                logger.info("Aufnahme nach %g Sekunden Sprechpause beendet", AUTO_STOP_SECONDS)
+                self.stop()
+                self.emit("StateChanged", "finishing", self.transport)
+                return
+            await asyncio.sleep(min(0.25, AUTO_STOP_SECONDS - silence))
 
     async def _capture(self):
         try:
@@ -197,6 +238,7 @@ class Session:
         params = self._parameters() | {
             "encoding": "linear16", "sample_rate": SAMPLE_RATE, "channels": 1,
             "interim_results": "true", "endpointing": 150,
+            "vad_events": "true",
         }
         try:
             socket = await connect(
@@ -242,6 +284,9 @@ class Session:
                 message = json.loads(raw)
                 if message.get("type") == "Error":
                     raise TranscriptionError("Deepgram konnte den Audiostream nicht verarbeiten.")
+                if message.get("type") == "SpeechStarted":
+                    self._mark_speech(message.get("timestamp"))
+                    continue
                 if message.get("type") != "Results":
                     continue
                 alternatives = message.get("channel", {}).get("alternatives", [])
@@ -260,6 +305,7 @@ class Session:
                     self.emit("Interim", "")
                 else:
                     if not self.commands.submit_requested:
+                        self._mark_transcript_speech(text, alternatives[0].get("words", []) if alternatives else [])
                         self.emit("Interim", text)
             if not closing:
                 raise TranscriptionError("Streaming-Verbindung unterbrochen.")
@@ -287,6 +333,7 @@ class Session:
             self.emit("Final", insertion)
 
     def _final(self, text, words=()):
+        self._mark_transcript_speech(text, words)
         output, submit = self.commands.feed(text, words)
         self._commit(output)
         if submit:

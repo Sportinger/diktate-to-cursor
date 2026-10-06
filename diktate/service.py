@@ -15,6 +15,7 @@ INTROSPECTION = """
   <method name="Toggle"/>
   <method name="Stop"/>
   <method name="GetState"><arg name="state" type="s" direction="out"/><arg name="mode" type="s" direction="out"/></method>
+  <method name="GetSilence"><arg name="seconds" type="d" direction="out"/></method>
   <signal name="StateChanged"><arg type="s"/><arg type="s"/></signal>
   <signal name="Interim"><arg type="s"/></signal>
   <signal name="Final"><arg type="s"/></signal>
@@ -22,6 +23,7 @@ INTROSPECTION = """
   <signal name="Error"><arg type="s"/></signal>
   <signal name="Notice"><arg type="s"/></signal>
   <signal name="SubmitRequested"/>
+  <signal name="SilenceChanged"><arg type="d"/></signal>
 </interface></node>
 """
 
@@ -43,7 +45,7 @@ class Service:
                     self.session = None
             if self.connection:
                 self.connection.emit_signal(None, OBJECT_PATH, INTERFACE, name,
-                                            GLib.Variant("(" + "s" * len(args) + ")", args))
+                                            GLib.Variant("(d)" if name == "SilenceChanged" else "(" + "s" * len(args) + ")", args))
             return GLib.SOURCE_REMOVE
         GLib.idle_add(deliver)
 
@@ -83,6 +85,9 @@ class Service:
             invocation.return_value(None)
         elif method == "GetState":
             invocation.return_value(GLib.Variant("(ss)", (self.state, self.mode)))
+        elif method == "GetSilence":
+            silence = self.session.silence_seconds() if self.session else 0.0
+            invocation.return_value(GLib.Variant("(d)", (silence,)))
         else:
             invocation.return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", "Unbekannte Methode.")
 

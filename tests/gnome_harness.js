@@ -55,6 +55,22 @@ export default class Harness extends Extension {
             throw new Error(`Recording UI incorrect: ${extension._state}, ${extension._overlay.visible}, ${extension._title.text}; mode=${Main.actionMode}`);
         if (!extension._icon.get_style().includes('#ff4545'))
             throw new Error('Recording icon is not red');
+        extension._onSignal('SilenceChanged', [7]);
+        if (extension._title.scale_x !== 1 || extension._title.get_style())
+            throw new Error('Pause effects started before 8 seconds');
+        extension._onSignal('SilenceChanged', [12]);
+        const middleScale = extension._title.scale_x;
+        extension._onSignal('SilenceChanged', [20]);
+        const maximumScale = extension._title.scale_x;
+        if (middleScale <= 1 || maximumScale <= middleScale || !extension._title.get_theme_node().get_text_shadow())
+            throw new Error('Pause did not gradually increase scale and glow');
+        extension._onSignal('SilenceChanged', [27]);
+        if (extension._title.scale_x !== maximumScale)
+            throw new Error('Pause effects kept growing beyond 20 seconds');
+        extension._onSignal('SilenceChanged', [0]);
+        if (extension._title.scale_x !== 1 || extension._title.translation_x !== 0 ||
+            extension._title.translation_y !== 0 || extension._title.get_style())
+            throw new Error('Speech did not reset pause effects');
         const path = GLib.getenv('DIKTATE_TEST_ARTIFACTS');
         const image = Gio.File.new_for_path(`${path}/overlay.png`);
         const stream = image.replace(null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null);
@@ -145,7 +161,7 @@ export default class Harness extends Extension {
         }
         if (!client.text.endsWith('^'))
             throw new Error(`Caret did not work after disabling the extension: ${client.text}`);
-        GLib.file_set_contents(`${path}/shell.json`, JSON.stringify({hotkey: true, noAutorepeat: true, recordingOverlay: true, redIcon: true, stop: true, stopAnimation: true, hiddenWhileFinishing: true, enterAfterPaste: true, modifiersDeferred: true, preferences: true, restoredCaret: true}));
+        GLib.file_set_contents(`${path}/shell.json`, JSON.stringify({hotkey: true, noAutorepeat: true, recordingOverlay: true, redIcon: true, pauseEffects: true, speechReset: true, stop: true, stopAnimation: true, hiddenWhileFinishing: true, enterAfterPaste: true, modifiersDeferred: true, preferences: true, restoredCaret: true}));
         console.log('DIKTATE SMOKE: PASS');
     }
 

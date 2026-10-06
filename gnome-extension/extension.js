@@ -15,6 +15,8 @@ const BUS = 'io.github.diktate.Cursor';
 const PATH = '/io/github/diktate/Cursor';
 const LISTENING_TEXT = 'höre...';
 const STOP_ANIMATION_MS = 600;
+const PAUSE_EFFECT_START_SECONDS = 8;
+const PAUSE_EFFECT_MAX_SECONDS = 20;
 const MODIFIERS = Clutter.ModifierType.SHIFT_MASK | Clutter.ModifierType.CONTROL_MASK |
     Clutter.ModifierType.MOD1_MASK | Clutter.ModifierType.SUPER_MASK |
     Clutter.ModifierType.META_MASK | Clutter.ModifierType.MOD5_MASK;
@@ -30,6 +32,8 @@ export default class DiktateExtension extends Extension {
         this._timeouts = new Set();
         this._stopAnimation = [];
         this._closingOverlay = false;
+        this._pauseStartedAt = 0;
+        this._pauseStyle = null;
         this._enabled = true;
         this._cancellable = new Gio.Cancellable();
         const backend = global.stage.context?.get_backend() ?? Clutter.get_default_backend();
@@ -60,6 +64,7 @@ export default class DiktateExtension extends Extension {
         this._overlay = new St.BoxLayout({vertical: true, reactive: false, can_focus: false,
             style_class: 'diktate-overlay', visible: false});
         this._title = new St.Label({text: LISTENING_TEXT, style_class: 'diktate-title', x_align: Clutter.ActorAlign.CENTER});
+        this._title.set_pivot_point(0.5, 0.5);
         this._preview = new St.Label({text: '', style_class: 'diktate-preview', x_align: Clutter.ActorAlign.CENTER});
         this._preview.clutter_text.line_wrap = true;
         this._preview.clutter_text.ellipsize = Pango.EllipsizeMode.END;
@@ -105,6 +110,7 @@ export default class DiktateExtension extends Extension {
             });
         this._pump = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 80, () => {
             this._drainPaste();
+            this._updatePauseVisual();
             return GLib.SOURCE_CONTINUE;
         });
         this._call('GetState', new GLib.Variant('()', []), reply => {
@@ -145,6 +151,8 @@ export default class DiktateExtension extends Extension {
             this._preview.text = args[0].slice(-180);
         else if (signal === 'Final')
             this._pasteQueue.push(args[0]);
+        else if (signal === 'SilenceChanged')
+            this._setSilence(args[0]);
         else if (signal === 'Finished') {
             this._lastText = args[0];
             this._copyItem.setSensitive(Boolean(this._lastText));
@@ -167,6 +175,11 @@ export default class DiktateExtension extends Extension {
             this._closingOverlay = false;
             this._preview.text = '';
             this._title.set_width(-1);
+            this._setSilence(0);
+            this._call('GetSilence', new GLib.Variant('()', []), reply => {
+                if (this._state === 'recording')
+                    this._setSilence(reply.deep_unpack()[0]);
+            });
         }
         const recording = state === 'recording';
         this._icon.set_style(recording ? 'color: #ff4545;' : state === 'finishing' ? 'color: #ffbd59;' : null);
@@ -181,6 +194,7 @@ export default class DiktateExtension extends Extension {
         } else if (state === 'finishing') {
             this._animateStopOverlay();
         } else if (state === 'idle' && !this._stopAnimation.length) {
+            this._resetPauseVisual();
             this._overlay.hide();
             this._title.text = '';
             this._preview.text = '';
@@ -191,6 +205,7 @@ export default class DiktateExtension extends Extension {
         if (this._closingOverlay)
             return;
         this._closingOverlay = true;
+        this._resetPauseVisual();
         this._title.text = LISTENING_TEXT;
         // Keep the left edge fixed while removing characters from the right.
         this._title.set_width(this._title.get_preferred_width(-1)[1]);
@@ -215,6 +230,45 @@ export default class DiktateExtension extends Extension {
                 GLib.source_remove(id);
         }
         this._stopAnimation = [];
+    }
+
+    _setSilence(seconds) {
+        if (!Number.isFinite(seconds))
+            return;
+        this._pauseStartedAt = GLib.get_monotonic_time() / 1e6 - Math.max(0, seconds);
+        this._updatePauseVisual();
+    }
+
+    _resetPauseVisual() {
+        this._title.set_scale(1, 1);
+        this._title.set_translation(0, 0, 0);
+        if (this._pauseStyle !== null) {
+            this._title.set_style(null);
+            this._pauseStyle = null;
+        }
+    }
+
+    _updatePauseVisual() {
+        if (this._state !== 'recording' || this._closingOverlay)
+            return;
+        const now = GLib.get_monotonic_time() / 1e6;
+        const silence = Math.max(0, now - this._pauseStartedAt);
+        const progress = Math.min(1, Math.max(0, (silence - PAUSE_EFFECT_START_SECONDS) /
+            (PAUSE_EFFECT_MAX_SECONDS - PAUSE_EFFECT_START_SECONDS)));
+        if (progress === 0) {
+            this._resetPauseVisual();
+            return;
+        }
+        const strength = progress * progress * (3 - 2 * progress);
+        const scale = 1 + 0.15 * strength;
+        this._title.set_scale(scale, scale);
+        this._title.set_translation(Math.sin(now * 16) * 1.6 * strength,
+            Math.sin(now * 21) * 0.8 * strength, 0);
+        const style = `text-shadow: 0px 0px ${Math.round(8 * strength)}px rgba(255,255,255,${(0.45 * strength).toFixed(2)});`;
+        if (style !== this._pauseStyle) {
+            this._title.set_style(style);
+            this._pauseStyle = style;
+        }
     }
 
     _positionOverlay() {
