@@ -13,6 +13,8 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
 const BUS = 'io.github.diktate.Cursor';
 const PATH = '/io/github/diktate/Cursor';
+const LISTENING_TEXT = 'höre...';
+const STOP_ANIMATION_MS = 600;
 const MODIFIERS = Clutter.ModifierType.SHIFT_MASK | Clutter.ModifierType.CONTROL_MASK |
     Clutter.ModifierType.MOD1_MASK | Clutter.ModifierType.SUPER_MASK |
     Clutter.ModifierType.META_MASK | Clutter.ModifierType.MOD5_MASK;
@@ -26,6 +28,8 @@ export default class DiktateExtension extends Extension {
         this._pasteQueue = [];
         this._submitPending = false;
         this._timeouts = new Set();
+        this._stopAnimation = [];
+        this._closingOverlay = false;
         this._enabled = true;
         this._cancellable = new Gio.Cancellable();
         const backend = global.stage.context?.get_backend() ?? Clutter.get_default_backend();
@@ -55,7 +59,7 @@ export default class DiktateExtension extends Extension {
 
         this._overlay = new St.BoxLayout({vertical: true, reactive: false, can_focus: false,
             style_class: 'diktate-overlay', visible: false});
-        this._title = new St.Label({text: 'höre...', style_class: 'diktate-title', x_align: Clutter.ActorAlign.CENTER});
+        this._title = new St.Label({text: LISTENING_TEXT, style_class: 'diktate-title', x_align: Clutter.ActorAlign.CENTER});
         this._preview = new St.Label({text: '', style_class: 'diktate-preview', x_align: Clutter.ActorAlign.CENTER});
         this._preview.clutter_text.line_wrap = true;
         this._preview.clutter_text.ellipsize = Pango.EllipsizeMode.END;
@@ -129,13 +133,15 @@ export default class DiktateExtension extends Extension {
                 this._pasting || this._submitPending)))
             return;
         this._button.menu.close();
+        if (this._state === 'recording')
+            this._animateStopOverlay();
         this._call('Toggle');
     }
 
     _onSignal(signal, args) {
         if (signal === 'StateChanged')
             this._setState(...args);
-        else if (signal === 'Interim')
+        else if (signal === 'Interim' && this._state === 'recording' && !this._closingOverlay)
             this._preview.text = args[0].slice(-180);
         else if (signal === 'Final')
             this._pasteQueue.push(args[0]);
@@ -156,18 +162,59 @@ export default class DiktateExtension extends Extension {
         const starting = state === 'recording' && this._state === 'idle';
         this._state = state;
         this._mode = mode;
-        if (starting)
+        if (starting) {
+            this._cancelStopAnimation();
+            this._closingOverlay = false;
             this._preview.text = '';
+            this._title.set_width(-1);
+        }
         const recording = state === 'recording';
         this._icon.set_style(recording ? 'color: #ff4545;' : state === 'finishing' ? 'color: #ffbd59;' : null);
         this._toggleItem.label.text = recording ? 'Aufnahme stoppen  ·  ^' : state === 'finishing' ? 'Diktat wird abgeschlossen …' : 'Aufnahme starten  ·  ^';
         this._toggleItem.setSensitive(state !== 'finishing');
         const transport = mode === 'streaming' ? 'Live-Streaming' : mode === 'chunks' ? 'Kurze Abschnitte' : 'Verbinde …';
         this._statusItem.label.text = state === 'idle' ? 'Bereit' : transport;
-        this._title.text = recording ? 'höre...' : 'schreibe...';
-        this._overlay.visible = state !== 'idle';
-        if (this._overlay.visible)
+        if (recording && !this._closingOverlay) {
+            this._title.text = LISTENING_TEXT;
+            this._overlay.show();
             this._positionOverlay();
+        } else if (state === 'finishing') {
+            this._animateStopOverlay();
+        } else if (state === 'idle' && !this._stopAnimation.length) {
+            this._overlay.hide();
+            this._title.text = '';
+            this._preview.text = '';
+        }
+    }
+
+    _animateStopOverlay() {
+        if (this._closingOverlay)
+            return;
+        this._closingOverlay = true;
+        this._title.text = LISTENING_TEXT;
+        // Keep the left edge fixed while removing characters from the right.
+        this._title.set_width(this._title.get_preferred_width(-1)[1]);
+        this._preview.text = '';
+        this._overlay.show();
+        this._positionOverlay();
+        for (let removed = 1; removed <= LISTENING_TEXT.length; removed++) {
+            const delay = Math.floor(STOP_ANIMATION_MS * removed / LISTENING_TEXT.length);
+            this._stopAnimation.push(this._later(delay, () => {
+                this._title.text = LISTENING_TEXT.slice(0, LISTENING_TEXT.length - removed);
+                if (removed === LISTENING_TEXT.length) {
+                    this._overlay.hide();
+                    this._stopAnimation = [];
+                }
+            }));
+        }
+    }
+
+    _cancelStopAnimation() {
+        for (const id of this._stopAnimation) {
+            if (this._timeouts.delete(id))
+                GLib.source_remove(id);
+        }
+        this._stopAnimation = [];
     }
 
     _positionOverlay() {
@@ -195,6 +242,7 @@ export default class DiktateExtension extends Extension {
             return GLib.SOURCE_REMOVE;
         });
         this._timeouts.add(id);
+        return id;
     }
 
     _drainPaste() {
@@ -280,5 +328,6 @@ export default class DiktateExtension extends Extension {
         this._pasteQueue = [];
         this._pasting = false;
         this._submitPending = false;
+        this._stopAnimation = [];
     }
 }

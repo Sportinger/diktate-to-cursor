@@ -61,9 +61,14 @@ export default class Harness extends Extension {
         await new Shell.Screenshot().screenshot(false, stream);
         stream.close(null);
         await press();
-        await wait(1200);
+        await wait(80);
+        if (!extension._overlay.visible || !extension._title.text ||
+            !'höre...'.startsWith(extension._title.text) || extension._title.text.length >= 7)
+            throw new Error(`Stop did not visibly erase the listening text: ${extension._title.text}`);
+        await wait(520);
         if (extension._state !== 'idle' || extension._overlay.visible)
             throw new Error('Overlay did not disappear after stop');
+        await wait(600);
         const file = Gio.File.new_for_path(`${path}/client.json`);
         if (!file.query_exists(null))
             throw new Error('Text insertion or final clipboard failed');
@@ -84,6 +89,9 @@ export default class Harness extends Extension {
         await wait(750);
         if (submittedFile.query_exists(null))
             throw new Error('Enter was pressed while Shift was held');
+        await wait(250);
+        if (extension._state !== 'finishing' || extension._overlay.visible)
+            throw new Error('Overlay stayed visible while waiting for final transcription');
         keyval(Clutter.KEY_Shift_L, Clutter.KeyState.RELEASED);
         for (let i = 0; i < 30 && !submittedFile.query_exists(null); i++)
             await wait(100);
@@ -137,7 +145,7 @@ export default class Harness extends Extension {
         }
         if (!client.text.endsWith('^'))
             throw new Error(`Caret did not work after disabling the extension: ${client.text}`);
-        GLib.file_set_contents(`${path}/shell.json`, JSON.stringify({hotkey: true, noAutorepeat: true, recordingOverlay: true, redIcon: true, stop: true, enterAfterPaste: true, modifiersDeferred: true, preferences: true, restoredCaret: true}));
+        GLib.file_set_contents(`${path}/shell.json`, JSON.stringify({hotkey: true, noAutorepeat: true, recordingOverlay: true, redIcon: true, stop: true, stopAnimation: true, hiddenWhileFinishing: true, enterAfterPaste: true, modifiersDeferred: true, preferences: true, restoredCaret: true}));
         console.log('DIKTATE SMOKE: PASS');
     }
 

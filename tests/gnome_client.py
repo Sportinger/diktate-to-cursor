@@ -42,11 +42,15 @@ def call(conn, sender, path, interface, method, args, invocation):
                     state = "finishing"
                     emit("StateChanged", state, "streaming")
                     emit("Final", "/model")
-                    emit("Final", " test")
-                    emit("Finished", "/model test")
-                    emit("SubmitRequested")
-                    state = "idle"
-                    emit("StateChanged", state, "")
+                    def finish_submit():
+                        global state
+                        emit("Final", " test")
+                        emit("Finished", "/model test")
+                        emit("SubmitRequested")
+                        state = "idle"
+                        emit("StateChanged", state, "")
+                        return GLib.SOURCE_REMOVE
+                    GLib.timeout_add(900, finish_submit)
                     return GLib.SOURCE_REMOVE
                 GLib.timeout_add(250, voice_submit)
                 invocation.return_value(None)
