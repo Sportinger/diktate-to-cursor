@@ -1,0 +1,1 @@
+# Diktate to Cursor
