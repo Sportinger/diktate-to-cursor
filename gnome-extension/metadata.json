@@ -1,0 +1,9 @@
+{
+  "uuid": "diktate-to-cursor@local",
+  "name": "Diktate to Cursor",
+  "description": "Deepgram-Live-Diktat am Cursor. ^ startet und stoppt die Aufnahme.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "version": 2,
+  "settings-schema": "org.gnome.shell.extensions.diktate-to-cursor",
+  "url": "https://github.com/Sportinger/diktate-to-cursor"
+}

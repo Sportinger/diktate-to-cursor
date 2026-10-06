@@ -1,0 +1,8 @@
+<schemalist>
+  <schema id="org.gnome.shell.extensions.diktate-to-cursor" path="/org/gnome/shell/extensions/diktate-to-cursor/">
+    <key name="diktate-toggle-recording" type="as">
+      <default>['dead_circumflex', 'asciicircum']</default>
+      <summary>Aufnahme starten und stoppen</summary>
+    </key>
+  </schema>
+</schemalist>

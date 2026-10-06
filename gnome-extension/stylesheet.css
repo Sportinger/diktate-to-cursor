@@ -1,0 +1,17 @@
+.diktate-overlay {
+    background-color: transparent;
+    border: none;
+    padding: 24px 30px;
+    spacing: 12px;
+    color: #ffffff;
+}
+.diktate-title {
+    font-size: 38px;
+    font-weight: 700;
+    color: #ffffff;
+}
+.diktate-preview {
+    font-size: 19px;
+    color: #ffffff;
+    text-align: center;
+}
