@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="440" viewBox="0 0 1200 440" role="img" aria-labelledby="title desc">
+<title id="title">Diktate to Cursor</title><desc id="desc">Voice dictation for your Linux desktop: press the caret key, speak, and paste words into the focused application.</desc>
+<defs><linearGradient id="bg" x2="1" y2="1"><stop stop-color="#171a31"/><stop offset="1" stop-color="#172c31"/></linearGradient><linearGradient id="accent"><stop stop-color="#a49bff"/><stop offset="1" stop-color="#52d6c7"/></linearGradient></defs>
+<rect width="1200" height="440" rx="24" fill="url(#bg)"/>
+<circle cx="1080" cy="70" r="230" fill="#8f8cff" opacity=".06"/>
+<g font-family="DejaVu Sans, sans-serif">
+<text x="64" y="76" font-size="15" letter-spacing="4" fill="#a7a9cd">VOICE DICTATION FOR GNOME</text>
+<text x="60" y="154" font-size="57" font-weight="bold" fill="#f4f5ff">Diktate to Cursor</text>
+<text x="64" y="207" font-size="25" fill="#b4bfd2">Your voice. Your words. Any text field.</text>
+<rect x="64" y="270" width="62" height="60" rx="12" fill="#30364b" stroke="#626c85"/><text x="95" y="310" text-anchor="middle" font-size="32" fill="white">^</text>
+<text x="149" y="308" font-size="20" fill="#c9d1df">Press to speak. Press again to stop.</text>
+<text x="64" y="390" font-size="15" fill="#8799b1">Linux + Wayland · Deepgram Nova-3 · MIT license</text>
+</g>
+<g transform="translate(873 151)" stroke="url(#accent)" stroke-linecap="round" fill="none">
+<rect x="18" y="-26" width="58" height="96" rx="29" stroke-width="6"/><path d="M0 38v10a47 47 0 0 0 94 0V38M47 95v31M22 126h50" stroke-width="6"/>
+<path d="M-55 25v25M-76 11v53M-97 27v21M-118 18v39M149 25v25M170 11v53M191 27v21M212 18v39" stroke-width="5"/>
+</g>
+<circle cx="920" cy="315" r="5" fill="#57e389"/><text x="939" y="321" font-family="DejaVu Sans, sans-serif" font-size="16" fill="#a8cbbc">Ready when you are</text>
+</svg>

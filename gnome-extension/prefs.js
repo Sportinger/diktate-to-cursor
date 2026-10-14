@@ -27,7 +27,7 @@ export default class DiktatePreferences extends ExtensionPreferences {
         group.add(key);
         const language = new Adw.ComboRow({title: 'Sprache',
             model: Gtk.StringList.new(['Deutsch', 'Automatisch (Deutsch, Englisch u. a.)', 'English']),
-            selected: Math.max(0, ['de', 'multi', 'en'].indexOf(config.language ?? 'multi'))});
+            selected: Math.max(0, ['de', 'multi', 'en'].indexOf(config.language ?? 'de'))});
         group.add(language);
         const model = new Adw.EntryRow({title: 'Modell', text: config.model ?? 'nova-3'});
         group.add(model);

@@ -8,15 +8,21 @@ import St from 'gi://St';
 
 import {Extension, InjectionManager} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as BoxPointer from 'resource:///org/gnome/shell/ui/boxpointer.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
+import {ScreenshotController} from './screenshot.js';
 
 const BUS = 'io.github.diktate.Cursor';
 const PATH = '/io/github/diktate/Cursor';
 const LISTENING_TEXT = 'höre...';
-const STOP_ANIMATION_MS = 600;
+const STARTING_TEXT = 'starte...';
+const READY_FLASH_SECONDS = 0.6;
+const STOP_ANIMATION_MS = 500;
 const PAUSE_EFFECT_START_SECONDS = 8;
 const PAUSE_EFFECT_MAX_SECONDS = 20;
+const LANGUAGES = [['de', 'Deutsch'], ['en', 'Englisch'], ['multi', 'Automatisch mehrsprachig']];
+const SCREENSHOT_QUALITIES = [['full', 'Volle Auflösung · PNG verlustfrei'], ['compact', 'Kompakt · maximal 1920 Pixel']];
 const MODIFIERS = Clutter.ModifierType.SHIFT_MASK | Clutter.ModifierType.CONTROL_MASK |
     Clutter.ModifierType.MOD1_MASK | Clutter.ModifierType.SUPER_MASK |
     Clutter.ModifierType.META_MASK | Clutter.ModifierType.MOD5_MASK;
@@ -24,6 +30,9 @@ const MODIFIERS = Clutter.ModifierType.SHIFT_MASK | Clutter.ModifierType.CONTROL
 export default class DiktateExtension extends Extension {
     enable() {
         this._state = 'idle';
+        this._captureReady = false;
+        this._enterBinding = false;
+        this._readyFlashUntil = 0;
         this._mode = '';
         this._lastText = '';
         this._pendingClipboard = null;
@@ -35,6 +44,9 @@ export default class DiktateExtension extends Extension {
         this._pauseStartedAt = 0;
         this._pauseStyle = null;
         this._enabled = true;
+        this._settings = this.getSettings();
+        this._screenshots = new ScreenshotController(this._settings,
+            saved => this._screenshotPathItem.setSensitive(saved));
         this._cancellable = new Gio.Cancellable();
         const backend = global.stage.context?.get_backend() ?? Clutter.get_default_backend();
         this._keyboard = backend.get_default_seat()
@@ -49,10 +61,58 @@ export default class DiktateExtension extends Extension {
         this._statusItem = new PopupMenu.PopupMenuItem('Bereit', {reactive: false});
         this._button.menu.addMenuItem(this._statusItem);
         this._button.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this._languageItem = new PopupMenu.PopupSubMenuMenuItem('Sprache: Deutsch');
+        this._languageChoices = new Map();
+        for (const [code, label] of LANGUAGES) {
+            const item = new PopupMenu.PopupMenuItem(label);
+            item.connect('activate', () => this._selectLanguage(code));
+            this._languageChoices.set(code, item);
+            this._languageItem.menu.addMenuItem(item);
+        }
+        this._languageItem.menu.addMenuItem(new PopupMenu.PopupMenuItem(
+            'Gilt ab der nächsten Aufnahme', {reactive: false}));
+        this._button.menu.addMenuItem(this._languageItem);
+        this._button.menu.connect('open-state-changed', (_menu, open) => {
+            if (open)
+                this._refreshLanguage();
+        });
+        // Handle the secondary button explicitly across GNOME versions.
+        this._button.connect('captured-event', (_actor, event) => {
+            const type = event.type();
+            if ((type === Clutter.EventType.BUTTON_PRESS || type === Clutter.EventType.BUTTON_RELEASE) &&
+                event.get_button() === 3) {
+                if (type === Clutter.EventType.BUTTON_PRESS)
+                    this._button.menu.toggle();
+                return Clutter.EVENT_STOP;
+            }
+            return Clutter.EVENT_PROPAGATE;
+        });
         this._copyItem = new PopupMenu.PopupMenuItem('Letztes Diktat kopieren');
         this._copyItem.setSensitive(false);
         this._copyItem.connect('activate', () => this._setClipboard(this._lastText));
         this._button.menu.addMenuItem(this._copyItem);
+        const screenshot = new PopupMenu.PopupMenuItem('Screenshot-Bereich  ·  Shift + Alt + S');
+        screenshot.connect('activate', () => this._takeScreenshot());
+        this._button.menu.addMenuItem(screenshot);
+        this._screenshotScreenItem = new PopupMenu.PopupMenuItem('Screenshot: ganzer Bildschirm');
+        this._screenshotScreenItem.connect('activate', () => this._takeScreenshot('screen'));
+        this._button.menu.addMenuItem(this._screenshotScreenItem);
+        this._screenshotQualityItem = new PopupMenu.PopupSubMenuMenuItem('Screenshot-Qualität');
+        this._screenshotQualityChoices = new Map();
+        for (const [value, label] of SCREENSHOT_QUALITIES) {
+            const item = new PopupMenu.PopupMenuItem(label);
+            item.connect('activate', () => this._settings.set_string('screenshot-quality', value));
+            this._screenshotQualityChoices.set(value, item);
+            this._screenshotQualityItem.menu.addMenuItem(item);
+        }
+        this._button.menu.addMenuItem(this._screenshotQualityItem);
+        this._qualityChanged = this._settings.connect('changed::screenshot-quality',
+            () => this._refreshScreenshotQuality());
+        this._refreshScreenshotQuality();
+        this._screenshotPathItem = new PopupMenu.PopupMenuItem('Letzten Screenshot-Pfad kopieren');
+        this._screenshotPathItem.setSensitive(false);
+        this._screenshotPathItem.connect('activate', () => this._screenshots.copyPath());
+        this._button.menu.addMenuItem(this._screenshotPathItem);
         const settings = new PopupMenu.PopupMenuItem('Einstellungen …');
         settings.connect('activate', () => this.openPreferences());
         this._button.menu.addMenuItem(settings);
@@ -77,6 +137,10 @@ export default class DiktateExtension extends Extension {
         // IGNORE_AUTOREPEAT ensures holding ^ does not toggle repeatedly.
         const action = Main.wm.addKeybinding('diktate-toggle-recording', this.getSettings(),
             Meta.KeyBindingFlags.IGNORE_AUTOREPEAT, Shell.ActionMode.NORMAL, () => this._toggle());
+        const screenshotAction = Main.wm.addKeybinding('diktate-screenshot', this.getSettings(),
+            Meta.KeyBindingFlags.IGNORE_AUTOREPEAT, Shell.ActionMode.NORMAL, () => this._takeScreenshot());
+        if (screenshotAction === Meta.KeyBindingAction.NONE)
+            Main.notify('Diktate to Cursor', 'Shift + Alt + S ist bereits belegt. Screenshots sind über das Mikrofon-Menü möglich.');
         this._accelerators = action === Meta.KeyBindingAction.NONE ? [] : [action];
         // Wayland's compositor input method can consume a dead accent before
         // Mutter checks shortcuts. Let our reserved key reach the keybinding.
@@ -119,6 +183,48 @@ export default class DiktateExtension extends Extension {
         });
     }
 
+    _configFile() {
+        return Gio.File.new_for_path(GLib.build_filenamev([
+            GLib.get_user_config_dir(), 'diktate-to-cursor', 'config.json']));
+    }
+
+    _readConfig() {
+        try {
+            const [, contents] = this._configFile().load_contents(null);
+            return JSON.parse(new TextDecoder().decode(contents));
+        } catch (error) {
+            if (error.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND))
+                return {};
+            throw error;
+        }
+    }
+
+    _refreshLanguage() {
+        try {
+            const code = this._readConfig().language ?? 'de';
+            const label = LANGUAGES.find(([language]) => language === code)?.[1] ?? code;
+            this._languageItem.label.text = `Sprache: ${label}`;
+            for (const [language, item] of this._languageChoices)
+                item.setOrnament(language === code ? PopupMenu.Ornament.DOT : PopupMenu.Ornament.NONE);
+        } catch (error) {
+            this._languageItem.label.text = 'Sprache: Einstellungen nicht lesbar';
+        }
+    }
+
+    _selectLanguage(code) {
+        try {
+            const config = this._readConfig();
+            config.language = code;
+            const file = this._configFile();
+            GLib.mkdir_with_parents(file.get_parent().get_path(), 0o700);
+            file.replace_contents(JSON.stringify(config, null, 2) + '\n', null, false,
+                Gio.FileCreateFlags.PRIVATE | Gio.FileCreateFlags.REPLACE_DESTINATION, null);
+            this._refreshLanguage();
+        } catch (error) {
+            Main.notify('Diktate to Cursor', 'Die Sprache konnte nicht gespeichert werden. Bitte die Einstellungen prüfen.');
+        }
+    }
+
     _call(method, args = new GLib.Variant('()', []), callback = null) {
         Gio.DBus.session.call(BUS, PATH, BUS, method, args, null,
             Gio.DBusCallFlags.NONE, 5000, this._cancellable, (connection, result) => {
@@ -131,6 +237,27 @@ export default class DiktateExtension extends Extension {
                         Main.notify('Diktate to Cursor', 'Diktatdienst nicht erreichbar. Bitte den Dienst neu starten.');
                 }
             });
+    }
+
+    _refreshScreenshotQuality() {
+        const selected = this._settings.get_string('screenshot-quality');
+        this._screenshotQualityItem.label.text = selected === 'compact'
+            ? 'Screenshot-Qualität: Kompakt' : 'Screenshot-Qualität: Volle Auflösung';
+        for (const [value, item] of this._screenshotQualityChoices)
+            item.setOrnament(value === selected ? PopupMenu.Ornament.DOT : PopupMenu.Ornament.NONE);
+    }
+
+    _takeScreenshot(mode = 'area') {
+        this._button.menu.close(BoxPointer.PopupAnimation.NONE);
+        return this._screenshots.capture(mode);
+    }
+
+    _stopAndSubmit() {
+        if (this._state !== 'recording' || this._closingOverlay)
+            return;
+        this._button.menu.close();
+        this._animateStopOverlay();
+        this._call('StopAndSubmit');
     }
 
     _toggle() {
@@ -153,6 +280,8 @@ export default class DiktateExtension extends Extension {
             this._pasteQueue.push(args[0]);
         else if (signal === 'SilenceChanged')
             this._setSilence(args[0]);
+        else if (signal === 'CaptureReady')
+            this._setCaptureReady(true);
         else if (signal === 'Finished') {
             this._lastText = args[0];
             this._copyItem.setSensitive(Boolean(this._lastText));
@@ -170,7 +299,17 @@ export default class DiktateExtension extends Extension {
         const starting = state === 'recording' && this._state === 'idle';
         this._state = state;
         this._mode = mode;
+        if (state === 'recording' && !this._enterBinding) {
+            const action = Main.wm.addKeybinding('diktate-stop-and-submit', this.getSettings(),
+                Meta.KeyBindingFlags.IGNORE_AUTOREPEAT, Shell.ActionMode.NORMAL, () => this._stopAndSubmit());
+            this._enterBinding = action !== Meta.KeyBindingAction.NONE;
+        } else if (state !== 'recording' && this._enterBinding) {
+            Main.wm.removeKeybinding('diktate-stop-and-submit');
+            this._enterBinding = false;
+        }
         if (starting) {
+            this._captureReady = false;
+            this._readyFlashUntil = 0;
             this._cancelStopAnimation();
             this._closingOverlay = false;
             this._preview.text = '';
@@ -180,6 +319,11 @@ export default class DiktateExtension extends Extension {
                 if (this._state === 'recording')
                     this._setSilence(reply.deep_unpack()[0]);
             });
+            this._call('GetCaptureReady', new GLib.Variant('()', []), reply => {
+                // A readiness signal may arrive before an older false reply.
+                if (reply.deep_unpack()[0])
+                    this._setCaptureReady(true);
+            });
         }
         const recording = state === 'recording';
         this._icon.set_style(recording ? 'color: #ff4545;' : state === 'finishing' ? 'color: #ffbd59;' : null);
@@ -188,7 +332,7 @@ export default class DiktateExtension extends Extension {
         const transport = mode === 'streaming' ? 'Live-Streaming' : mode === 'chunks' ? 'Kurze Abschnitte' : 'Verbinde …';
         this._statusItem.label.text = state === 'idle' ? 'Bereit' : transport;
         if (recording && !this._closingOverlay) {
-            this._title.text = LISTENING_TEXT;
+            this._title.text = this._captureReady ? LISTENING_TEXT : STARTING_TEXT;
             this._overlay.show();
             this._positionOverlay();
         } else if (state === 'finishing') {
@@ -201,22 +345,35 @@ export default class DiktateExtension extends Extension {
         }
     }
 
+    _setCaptureReady(ready) {
+        if (this._state !== 'recording' || this._closingOverlay)
+            return;
+        if (ready && !this._captureReady)
+            this._readyFlashUntil = GLib.get_monotonic_time() / 1e6 + READY_FLASH_SECONDS;
+        this._captureReady = ready;
+        this._title.text = ready ? LISTENING_TEXT : STARTING_TEXT;
+        this._updatePauseVisual();
+    }
+
     _animateStopOverlay() {
         if (this._closingOverlay)
             return;
         this._closingOverlay = true;
+        this._readyFlashUntil = 0;
         this._resetPauseVisual();
-        this._title.text = LISTENING_TEXT;
+        const text = this._title.text || (this._captureReady ? LISTENING_TEXT : STARTING_TEXT);
+        this._title.text = text;
         // Keep the left edge fixed while removing characters from the right.
         this._title.set_width(this._title.get_preferred_width(-1)[1]);
         this._preview.text = '';
         this._overlay.show();
         this._positionOverlay();
-        for (let removed = 1; removed <= LISTENING_TEXT.length; removed++) {
-            const delay = Math.floor(STOP_ANIMATION_MS * removed / LISTENING_TEXT.length);
+        for (let removed = 1; removed <= text.length; removed++) {
+            // Quadratic ease-in: erase slowly at first, then accelerate.
+            const delay = Math.floor(STOP_ANIMATION_MS * Math.sqrt(removed / text.length));
             this._stopAnimation.push(this._later(delay, () => {
-                this._title.text = LISTENING_TEXT.slice(0, LISTENING_TEXT.length - removed);
-                if (removed === LISTENING_TEXT.length) {
+                this._title.text = text.slice(0, text.length - removed);
+                if (removed === text.length) {
                     this._overlay.hide();
                     this._stopAnimation = [];
                 }
@@ -239,12 +396,12 @@ export default class DiktateExtension extends Extension {
         this._updatePauseVisual();
     }
 
-    _resetPauseVisual() {
+    _resetPauseVisual(style = null) {
         this._title.set_scale(1, 1);
         this._title.set_translation(0, 0, 0);
-        if (this._pauseStyle !== null) {
-            this._title.set_style(null);
-            this._pauseStyle = null;
+        if (this._pauseStyle !== style) {
+            this._title.set_style(style);
+            this._pauseStyle = style;
         }
     }
 
@@ -256,7 +413,9 @@ export default class DiktateExtension extends Extension {
         const progress = Math.min(1, Math.max(0, (silence - PAUSE_EFFECT_START_SECONDS) /
             (PAUSE_EFFECT_MAX_SECONDS - PAUSE_EFFECT_START_SECONDS)));
         if (progress === 0) {
-            this._resetPauseVisual();
+            const readyStyle = this._captureReady && now < this._readyFlashUntil
+                ? 'color: #57e389; text-shadow: 0px 0px 8px rgba(87,227,137,0.55);' : null;
+            this._resetPauseVisual(readyStyle);
             return;
         }
         const strength = progress * progress * (3 - 2 * progress);
@@ -264,7 +423,9 @@ export default class DiktateExtension extends Extension {
         this._title.set_scale(scale, scale);
         this._title.set_translation(Math.sin(now * 16) * 1.6 * strength,
             Math.sin(now * 21) * 0.8 * strength, 0);
-        const style = `text-shadow: 0px 0px ${Math.round(8 * strength)}px rgba(255,255,255,${(0.45 * strength).toFixed(2)});`;
+        const greenBlue = Math.round(255 - (255 - 69) * strength);
+        const style = `color: rgb(255,${greenBlue},${greenBlue}); ` +
+            `text-shadow: 0px 0px ${Math.round(8 * strength)}px rgba(255,69,69,${(0.45 * strength).toFixed(2)});`;
         if (style !== this._pauseStyle) {
             this._title.set_style(style);
             this._pauseStyle = style;
@@ -350,12 +511,15 @@ export default class DiktateExtension extends Extension {
     }
 
     _canType() {
-        return Main.actionMode === Shell.ActionMode.NORMAL && !this._button.menu.isOpen &&
+        return Main.actionMode === Shell.ActionMode.NORMAL && !this._button.menu.isOpen && !this._screenshots.busy &&
             Boolean(global.display.focus_window) && !(global.get_pointer()[2] & MODIFIERS);
     }
 
     disable() {
         this._enabled = false;
+        this._screenshots?.destroy();
+        if (this._qualityChanged)
+            this._settings.disconnect(this._qualityChanged);
         // Stop capture when GNOME locks or the extension is disabled.
         Gio.DBus.session.call(BUS, PATH, BUS, 'Stop', new GLib.Variant('()', []), null,
             Gio.DBusCallFlags.NO_AUTO_START, 1000, null, null);
@@ -370,10 +534,11 @@ export default class DiktateExtension extends Extension {
         for (const id of this._timeouts ?? [])
             GLib.source_remove(id);
         Main.wm.removeKeybinding('diktate-toggle-recording');
+        Main.wm.removeKeybinding('diktate-screenshot');
+        if (this._enterBinding)
+            Main.wm.removeKeybinding('diktate-stop-and-submit');
         if (this._monitorSignal)
             Main.layoutManager.disconnect(this._monitorSignal);
-        if (this._lastText)
-            this._setClipboard(this._lastText);
         this._overlay?.destroy();
         this._button?.destroy();
         this._overlay = null;

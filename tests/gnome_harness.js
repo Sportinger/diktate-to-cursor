@@ -1,7 +1,9 @@
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
+import GdkPixbuf from 'gi://GdkPixbuf';
 import Shell from 'gi://Shell';
+import St from 'gi://St';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Keyboard from 'resource:///org/gnome/shell/ui/status/keyboard.js';
@@ -43,14 +45,59 @@ export default class Harness extends Extension {
         if (!global.display.focus_window)
             throw new Error('Text field did not get focus');
         await wait(500);
+        const pointer = global.stage.context.get_backend().get_default_seat()
+            .create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE);
+        const [buttonX, buttonY] = extension._button.get_transformed_position();
+        const [buttonWidth, buttonHeight] = extension._button.get_transformed_size();
+        pointer.notify_absolute_motion(GLib.get_monotonic_time(), buttonX + buttonWidth / 2, buttonY + buttonHeight / 2);
+        await wait(100);
+        pointer.notify_button(GLib.get_monotonic_time(), 3, Clutter.ButtonState.PRESSED);
+        await wait(60);
+        pointer.notify_button(GLib.get_monotonic_time(), 3, Clutter.ButtonState.RELEASED);
+        await wait(150);
+        if (!extension._button.menu.isOpen || extension._languageItem.label.text !== 'Sprache: Deutsch')
+            throw new Error(`Right click failed: open=${extension._button.menu.isOpen}, label=${extension._languageItem.label.text}, position=${global.get_pointer()}, target=${buttonX},${buttonY},${buttonWidth},${buttonHeight}`);
+        const configFile = extension._configFile();
+        GLib.mkdir_with_parents(configFile.get_parent().get_path(), 0o700);
+        configFile.replace_contents(JSON.stringify({api_key: 'test-key', microphone: 'test-source'}),
+            null, false, Gio.FileCreateFlags.PRIVATE, null);
+        extension._languageChoices.get('en').activate(null);
+        let selectedConfig = extension._readConfig();
+        if (selectedConfig.language !== 'en' || selectedConfig.api_key !== 'test-key' || selectedConfig.microphone !== 'test-source')
+            throw new Error('Language selection was not saved or changed unrelated settings');
+        extension._button.menu.open();
+        if (extension._languageItem.label.text !== 'Sprache: Englisch')
+            throw new Error('Language selection was not reflected in the menu');
+        extension._languageChoices.get('de').activate(null);
+        if (extension._readConfig().language !== 'de')
+            throw new Error('Could not switch back to German');
+        extension._button.menu.close();
+        await wait(200);
         const press = async (duration = 60) => {
             const time = GLib.get_monotonic_time();
             keyboard.notify_key(time, 41, Clutter.KeyState.PRESSED);
             await wait(duration);
             keyboard.notify_key(GLib.get_monotonic_time(), 41, Clutter.KeyState.RELEASED);
         };
-        await press(850);
+        const heldPress = press(850);
         await wait(100);
+        if (extension._state !== 'recording' || extension._title.text !== 'starte...')
+            throw new Error('Overlay claimed to listen before microphone readiness');
+        if (extension._title.get_style())
+            throw new Error('Readiness flash appeared before microphone readiness');
+        await wait(300);
+        const readyColor = extension._title.get_theme_node().get_foreground_color();
+        if (extension._title.text !== 'höre...' || readyColor.red !== 87 ||
+            readyColor.green !== 227 || readyColor.blue !== 137)
+            throw new Error('Microphone readiness did not flash green');
+        const flashUntil = extension._readyFlashUntil;
+        extension._onSignal('CaptureReady', []);
+        if (extension._readyFlashUntil !== flashUntil)
+            throw new Error('Duplicate readiness signal restarted the flash');
+        await heldPress;
+        await wait(100);
+        if (extension._title.get_style())
+            throw new Error('Readiness flash did not return to white');
         if (extension._state !== 'recording' || !extension._overlay.visible || extension._title.text !== 'höre...')
             throw new Error(`Recording UI incorrect: ${extension._state}, ${extension._overlay.visible}, ${extension._title.text}; mode=${Main.actionMode}`);
         if (!extension._icon.get_style().includes('#ff4545'))
@@ -64,6 +111,9 @@ export default class Harness extends Extension {
         const maximumScale = extension._title.scale_x;
         if (middleScale <= 1 || maximumScale <= middleScale || !extension._title.get_theme_node().get_text_shadow())
             throw new Error('Pause did not gradually increase scale and glow');
+        const color = extension._title.get_theme_node().get_foreground_color();
+        if (color.red !== 255 || color.green !== 69 || color.blue !== 69)
+            throw new Error('Pause warning did not turn red');
         extension._onSignal('SilenceChanged', [27]);
         if (extension._title.scale_x !== maximumScale)
             throw new Error('Pause effects kept growing beyond 20 seconds');
@@ -78,10 +128,13 @@ export default class Harness extends Extension {
         stream.close(null);
         await press();
         await wait(80);
+        if (extension._title.text !== 'höre...')
+            throw new Error('Stop animation did not start slowly');
+        await wait(120);
         if (!extension._overlay.visible || !extension._title.text ||
             !'höre...'.startsWith(extension._title.text) || extension._title.text.length >= 7)
             throw new Error(`Stop did not visibly erase the listening text: ${extension._title.text}`);
-        await wait(520);
+        await wait(300);
         if (extension._state !== 'idle' || extension._overlay.visible)
             throw new Error('Overlay did not disappear after stop');
         await wait(600);
@@ -117,6 +170,138 @@ export default class Harness extends Extension {
         const submitted = JSON.parse(new TextDecoder().decode(submittedBytes));
         if (submitted.text !== '/model test' || submitted.clipboard !== '/model test' || submitted.enters !== 1)
             throw new Error(`Incorrect voice submission: ${JSON.stringify(submitted)}`);
+        // Physical Enter must be intercepted, flush late words, and submit once.
+        keyval(Clutter.KEY_Control_L, Clutter.KeyState.PRESSED);
+        keyval(Clutter.KEY_a, Clutter.KeyState.PRESSED);
+        keyval(Clutter.KEY_a, Clutter.KeyState.RELEASED);
+        keyval(Clutter.KEY_Control_L, Clutter.KeyState.RELEASED);
+        keyval(Clutter.KEY_BackSpace, Clutter.KeyState.PRESSED);
+        keyval(Clutter.KEY_BackSpace, Clutter.KeyState.RELEASED);
+        await wait(100);
+        await press();
+        await wait(350);
+        keyval(Clutter.KEY_Return, Clutter.KeyState.PRESSED);
+        keyval(Clutter.KEY_Return, Clutter.KeyState.RELEASED);
+        await wait(1000);
+        const [, keyboardSubmittedBytes] = submittedFile.load_contents(null);
+        const keyboardSubmitted = JSON.parse(new TextDecoder().decode(keyboardSubmittedBytes));
+        if (extension._state !== 'idle' || extension._enterBinding || keyboardSubmitted.enters !== 2 ||
+            keyboardSubmitted.text !== 'Hallo Welt. Noch ein Satz.')
+            throw new Error(`Physical Enter did not finish and submit once: ${JSON.stringify(keyboardSubmitted)}`);
+
+        const screenshotHotkey = async () => {
+            keyval(Clutter.KEY_Shift_L, Clutter.KeyState.PRESSED);
+            keyval(Clutter.KEY_Alt_L, Clutter.KeyState.PRESSED);
+            keyval(Clutter.KEY_s, Clutter.KeyState.PRESSED);
+            keyval(Clutter.KEY_s, Clutter.KeyState.RELEASED);
+            keyval(Clutter.KEY_Alt_L, Clutter.KeyState.RELEASED);
+            keyval(Clutter.KEY_Shift_L, Clutter.KeyState.RELEASED);
+            await wait(200);
+        };
+        const changingContent = new St.Widget({
+            x: 450, y: 200, width: 201, height: 121,
+            style: 'background-color: #e04020;',
+        });
+        Main.uiGroup.add_child(changingContent);
+        await wait(100);
+        const readTestArea = async () => {
+            const captureStream = Gio.MemoryOutputStream.new_resizable();
+            await new Shell.Screenshot().screenshot_area(450, 200, 201, 121, captureStream);
+            captureStream.close(null);
+            const input = Gio.MemoryInputStream.new_from_bytes(captureStream.steal_as_bytes());
+            try {
+                return GdkPixbuf.Pixbuf.new_from_stream(input, null);
+            } finally {
+                input.close(null);
+            }
+        };
+        const pixel = pixbuf => {
+            const offset = 60 * pixbuf.get_rowstride() + 100 * pixbuf.get_n_channels();
+            return Array.from(pixbuf.get_pixels().slice(offset, offset + 3));
+        };
+        const referenceImage = await readTestArea();
+        await screenshotHotkey();
+        if (!extension._screenshots.busy || !extension._screenshots._selector?.visible)
+            throw new Error('Shift+Alt+S did not open screenshot selection');
+        const frozenPreview = await readTestArea();
+        changingContent.set_style('background-color: #2060e0;');
+        await wait(250);
+        const changedPreview = await readTestArea();
+        if (JSON.stringify(pixel(frozenPreview)) !== JSON.stringify(pixel(changedPreview)))
+            throw new Error('Screenshot preview changed with the live desktop');
+        pointer.notify_absolute_motion(GLib.get_monotonic_time(), 450, 200);
+        await wait(80);
+        pointer.notify_button(GLib.get_monotonic_time(), 1, Clutter.ButtonState.PRESSED);
+        await wait(80);
+        pointer.notify_absolute_motion(GLib.get_monotonic_time(), 650, 320);
+        await wait(100);
+        pointer.notify_button(GLib.get_monotonic_time(), 1, Clutter.ButtonState.RELEASED);
+        for (let i = 0; i < 40 && extension._screenshots.busy; i++)
+            await wait(100);
+        if (extension._screenshots.busy)
+            throw new Error('Screenshot did not complete on mouse release');
+        if (extension._screenshots._frozenDesktop)
+            throw new Error('Frozen desktop remained after selection');
+        const liveImage = await readTestArea();
+        if (JSON.stringify(pixel(liveImage)) === JSON.stringify(pixel(referenceImage)))
+            throw new Error('Live content did not change behind the frozen desktop');
+        changingContent.destroy();
+        extension._call('TestScreenshotClipboard');
+        const screenshotResult = Gio.File.new_for_path(`${path}/client-screenshot.json`);
+        for (let i = 0; i < 30 && !screenshotResult.query_exists(null); i++)
+            await wait(100);
+        if (!screenshotResult.query_exists(null))
+            throw new Error('Screenshot could not be pasted as an image and text');
+        const [, screenshotBytes] = screenshotResult.load_contents(null);
+        const screenshotData = JSON.parse(new TextDecoder().decode(screenshotBytes));
+        if (screenshotData.width !== 201 || screenshotData.height !== 121)
+            throw new Error(`Incorrect screenshot clipboard: ${JSON.stringify(screenshotData)}`);
+        extension._screenshotPathItem.activate(null);
+        const screenshotPathText = await new Promise(resolve =>
+            St.Clipboard.get_default().get_text(St.ClipboardType.CLIPBOARD, (_clipboard, text) => resolve(text)));
+        const [, screenshotPaths] = GLib.shell_parse_argv(screenshotPathText);
+        if (screenshotPaths.length !== 1 || !Gio.File.new_for_path(screenshotPaths[0]).query_exists(null))
+            throw new Error('Screenshot terminal path does not point to the saved image');
+        const croppedImage = GdkPixbuf.Pixbuf.new_from_file(screenshotPaths[0]);
+        if (JSON.stringify(pixel(croppedImage)) !== JSON.stringify(pixel(referenceImage)))
+            throw new Error('Screenshot did not preserve the original frame without the selection overlay');
+        Gio.File.new_for_path(screenshotPaths[0]).copy(Gio.File.new_for_path(`${path}/cropped.png`),
+            Gio.FileCopyFlags.OVERWRITE, null, null);
+        if (extension._settings.get_string('screenshot-quality') !== 'full')
+            throw new Error('Screenshots must default to full resolution');
+        const source = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, false, 8, 3440, 1440);
+        source.fill(0xabcdefff);
+        const [, sourceBuffer] = source.save_to_bufferv('png', [], []);
+        const sourceBytes = GLib.Bytes.new(sourceBuffer);
+        let prepared = extension._screenshots._prepareImage(sourceBytes);
+        if (prepared.width !== 3440 || prepared.height !== 1440 || !prepared.png.equal(sourceBytes))
+            throw new Error('Full-resolution screenshot was altered');
+        extension._screenshotQualityChoices.get('compact').activate(null);
+        if (!extension._screenshotQualityItem.label.text.includes('Kompakt'))
+            throw new Error('Screenshot quality menu did not update');
+        prepared = extension._screenshots._prepareImage(sourceBytes);
+        const compactImage = GdkPixbuf.Pixbuf.new_from_stream(
+            Gio.MemoryInputStream.new_from_bytes(prepared.png), null);
+        if (compactImage.width !== 1920 || compactImage.height !== 804)
+            throw new Error('Compact screenshot did not preserve its aspect ratio');
+        const [, smallBuffer] = croppedImage.save_to_bufferv('png', [], []);
+        const smallBytes = GLib.Bytes.new(smallBuffer);
+        if (!extension._screenshots._prepareImage(smallBytes).png.equal(smallBytes))
+            throw new Error('Compact screenshot enlarged a small image');
+        extension._screenshotQualityChoices.get('full').activate(null);
+        extension._button.menu.open();
+        extension._screenshotScreenItem.activate(null);
+        for (let i = 0; i < 40 && extension._screenshots.busy; i++)
+            await wait(100);
+        const screenImage = GdkPixbuf.Pixbuf.new_from_file(extension._screenshots._lastFile.get_path());
+        if (screenImage.width !== 1280 || screenImage.height !== 720 || extension._button.menu.isOpen)
+            throw new Error('Full-screen screenshot or closing the menu failed');
+        await screenshotHotkey();
+        keyval(Clutter.KEY_Escape, Clutter.KeyState.PRESSED);
+        keyval(Clutter.KEY_Escape, Clutter.KeyState.RELEASED);
+        await wait(300);
+        if (extension._screenshots.busy || extension._screenshots._frozenDesktop)
+            throw new Error('Escape did not cancel screenshot selection');
         extension.openPreferences();
         let preferences = false;
         for (let i = 0; i < 50; i++) {
@@ -134,7 +319,11 @@ export default class Harness extends Extension {
                 break;
             await wait(100);
         }
+        await screenshotHotkey();
         await Main.extensionManager.disableExtension('diktate-to-cursor@local');
+        await wait(150);
+        if (extension._screenshots.busy || extension._screenshots._frozenDesktop)
+            throw new Error('Disabling the extension left screenshot selection active');
         const textWindow = global.display.list_all_windows().find(window => window.get_title() === 'Diktate smoke test');
         if (!textWindow)
             throw new Error('Text window disappeared');
@@ -161,7 +350,7 @@ export default class Harness extends Extension {
         }
         if (!client.text.endsWith('^'))
             throw new Error(`Caret did not work after disabling the extension: ${client.text}`);
-        GLib.file_set_contents(`${path}/shell.json`, JSON.stringify({hotkey: true, noAutorepeat: true, recordingOverlay: true, redIcon: true, pauseEffects: true, speechReset: true, stop: true, stopAnimation: true, hiddenWhileFinishing: true, enterAfterPaste: true, modifiersDeferred: true, preferences: true, restoredCaret: true}));
+        GLib.file_set_contents(`${path}/shell.json`, JSON.stringify({screenshotFrozenPreview: true, screenshotFrozenCrop: true, screenshotFullResolution: true, screenshotCompact: true, screenshotScreen: true, screenshotCrop: true, screenshotImageClipboard: true, screenshotPath: true, screenshotCancel: true, screenshotDisable: true, physicalEnterSubmit: true, rightClickLanguage: true, hotkey: true, noAutorepeat: true, recordingOverlay: true, greenReadyFlash: true, redIcon: true, pauseEffects: true, redPauseWarning: true, speechReset: true, stop: true, stopAnimation: true, hiddenWhileFinishing: true, enterAfterPaste: true, modifiersDeferred: true, preferences: true, restoredCaret: true}));
         console.log('DIKTATE SMOKE: PASS');
     }
 

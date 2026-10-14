@@ -12,7 +12,7 @@ def config_path() -> Path:
 @dataclass
 class Config:
     api_key: str = ""
-    language: str = "multi"
+    language: str = "de"
     model: str = "nova-3"
     mode: str = "auto"
     microphone: str = "default"

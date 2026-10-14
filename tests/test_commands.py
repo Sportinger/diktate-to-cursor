@@ -73,6 +73,28 @@ class CommandTests(unittest.TestCase):
 
 
 class SessionCommandTests(unittest.TestCase):
+    def test_keyboard_submit_keeps_late_words_and_sends_once(self):
+        for error in [None, TranscriptionError('Verbindung unterbrochen')]:
+            with self.subTest(error=error):
+                events = []
+                session = Session(Config(), lambda *args: events.append(args))
+                async def run():
+                    session._final('Erste Wörter.')
+                    session.stop(submit=True)
+                    session.stop(submit=True)
+                    session._final('Letzte Wörter.')
+                    if error:
+                        raise error
+                with patch.object(session, '_run', run):
+                    session.run()
+                self.assertEqual(session.transcript.text, 'Erste Wörter. Letzte Wörter.')
+                if error:
+                    self.assertNotIn(('SubmitRequested',), events)
+                else:
+                    self.assertEqual(events.count(('SubmitRequested',)), 1)
+                    self.assertLess(events.index(('Finished', session.transcript.text)),
+                                    events.index(('SubmitRequested',)))
+
     def test_submit_is_emitted_once_after_finished_and_not_after_an_error(self):
         for error in [None, TranscriptionError("Verbindung unterbrochen")]:
             with self.subTest(error=error):

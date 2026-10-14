@@ -8,7 +8,7 @@ import tempfile
 import unittest
 import wave
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 
@@ -76,6 +76,59 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.events = []
         self.session = Session(Config(api_key="test-key"), lambda *args: self.events.append(args))
         self.session.changed = asyncio.Event()
+
+    async def test_audio_from_start_is_preserved_during_slow_connection(self):
+        beginning = struct.pack('<h', 1800) * 1600
+        tail = struct.pack('<h', 2400) * 800
+        captured = asyncio.Event()
+        socket = Socket([result('Erstes und letztes Wort.', duration=0.15)])
+
+        async def capture():
+            self.session.audio.extend(beginning)
+            self.session.changed.set()
+            captured.set()
+            await asyncio.sleep(0.02)
+            self.session.audio.extend(tail)
+            self.session.ended = True
+            self.session.changed.set()
+
+        async def slow_connect(*args, **kwargs):
+            await captured.wait()
+            await asyncio.sleep(0.04)
+            self.assertTrue(self.session.ended)
+            return socket
+
+        with patch.object(self.session, '_capture', capture), \
+                patch('diktate.transcription.connect', slow_connect):
+            await self.session._run()
+        sent = b''.join(frame for frame in socket.sent if isinstance(frame, bytes))
+        self.assertEqual(sent, beginning + tail)
+        self.assertEqual(self.session.transcript.text, 'Erstes und letztes Wort.')
+
+    async def test_capture_ready_requires_audio_and_keeps_first_samples(self):
+        process = Mock()
+        first_frame = struct.pack('<hh', 1234, -1234) * 160
+        process.stdout.read = AsyncMock(side_effect=[first_frame] * 6 + [b''])
+        process.wait = AsyncMock(return_value=0)
+
+        async def spawn(*args, **kwargs):
+            self.assertFalse(self.session.capture_ready)
+            self.assertNotIn(('CaptureReady',), self.events)
+            return process
+
+        with patch('diktate.transcription.asyncio.create_subprocess_exec', spawn):
+            await self.session._capture()
+        self.assertEqual(self.events.count(('CaptureReady',)), 1)
+        self.assertTrue(self.session.capture_ready)
+        self.assertEqual(self.session.audio, first_frame * 6)
+
+    async def test_failed_microphone_never_announces_readiness(self):
+        with patch('diktate.transcription.asyncio.create_subprocess_exec',
+                   AsyncMock(side_effect=OSError('no device'))):
+            await self.session._capture()
+        self.assertFalse(self.session.capture_ready)
+        self.assertNotIn(('CaptureReady',), self.events)
+        self.assertIsNotNone(self.session.capture_error)
 
     async def test_stream_waits_for_last_words_and_deduplicates_finals(self):
         self.session.audio = bytearray(bytes(BYTES_PER_SECOND * 2))

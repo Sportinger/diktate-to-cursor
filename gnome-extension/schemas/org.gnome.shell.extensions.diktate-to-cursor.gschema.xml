@@ -4,5 +4,21 @@
       <default>['dead_circumflex', 'asciicircum']</default>
       <summary>Aufnahme starten und stoppen</summary>
     </key>
+    <key name="diktate-screenshot" type="as">
+      <default>['&lt;Shift&gt;&lt;Alt&gt;s']</default>
+      <summary>Screenshot-Bereich auswählen und kopieren</summary>
+    </key>
+    <key name="screenshot-quality" type="s">
+      <choices>
+        <choice value="full"/>
+        <choice value="compact"/>
+      </choices>
+      <default>'full'</default>
+      <summary>Screenshot-Auflösung: volle Pixelzahl oder maximal 1920 Pixel</summary>
+    </key>
+    <key name="diktate-stop-and-submit" type="as">
+      <default>['Return', 'KP_Enter']</default>
+      <summary>Während des Diktats stoppen und nach dem letzten Wort Enter drücken</summary>
+    </key>
   </schema>
 </schemalist>

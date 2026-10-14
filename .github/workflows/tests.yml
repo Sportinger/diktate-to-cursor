@@ -1,0 +1,24 @@
+name: Tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Python and GObject dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-venv python3-gi
+      - name: Prepare environment without installing the desktop service
+        run: |
+          /usr/bin/python3 -m venv --system-site-packages .venv
+          .venv/bin/python -m pip install -e .
+      - run: .venv/bin/python -m unittest discover -s tests -v
+      - name: Check extension syntax
+        run: |
+          node --check gnome-extension/extension.js
+          node --check gnome-extension/prefs.js
+          node --check gnome-extension/screenshot.js

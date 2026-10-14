@@ -6,8 +6,16 @@ build-backend = "setuptools.build_meta"
 name = "diktate-to-cursor"
 version = "0.1.0"
 description = "Deepgram-Diktat direkt am Cursor für GNOME und Wayland"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "Sportinger"}]
 requires-python = ">=3.11"
 dependencies = ["websockets>=15,<17", "httpx>=0.28,<1"]
+
+[project.urls]
+Homepage = "https://github.com/Sportinger/diktate-to-cursor"
+Issues = "https://github.com/Sportinger/diktate-to-cursor/issues"
 
 [project.scripts]
 diktate-to-cursor = "diktate.__main__:main"

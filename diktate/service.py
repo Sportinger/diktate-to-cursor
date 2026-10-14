@@ -14,8 +14,11 @@ INTROSPECTION = """
 <node><interface name="io.github.diktate.Cursor">
   <method name="Toggle"/>
   <method name="Stop"/>
+  <method name="StopAndSubmit"/>
   <method name="GetState"><arg name="state" type="s" direction="out"/><arg name="mode" type="s" direction="out"/></method>
   <method name="GetSilence"><arg name="seconds" type="d" direction="out"/></method>
+  <method name="GetCaptureReady"><arg name="ready" type="b" direction="out"/></method>
+  <signal name="CaptureReady"/>
   <signal name="StateChanged"><arg type="s"/><arg type="s"/></signal>
   <signal name="Interim"><arg type="s"/></signal>
   <signal name="Final"><arg type="s"/></signal>
@@ -70,11 +73,11 @@ class Service:
         self.worker = threading.Thread(target=self.session.run, name="deepgram-recording", daemon=True)
         self.worker.start()
 
-    def stop(self):
+    def stop(self, submit=False):
         if self.session and self.state != "finishing":
             self.state = "finishing"
             self.emit("StateChanged", self.state, self.mode)
-            self.session.stop()
+            self.session.stop(submit=submit)
 
     def _call(self, connection, sender, path, interface, method, params, invocation):
         if method == "Toggle":
@@ -83,11 +86,17 @@ class Service:
         elif method == "Stop":
             self.stop()
             invocation.return_value(None)
+        elif method == "StopAndSubmit":
+            self.stop(submit=True)
+            invocation.return_value(None)
         elif method == "GetState":
             invocation.return_value(GLib.Variant("(ss)", (self.state, self.mode)))
         elif method == "GetSilence":
             silence = self.session.silence_seconds() if self.session else 0.0
             invocation.return_value(GLib.Variant("(d)", (silence,)))
+        elif method == "GetCaptureReady":
+            ready = bool(self.session and self.session.capture_ready)
+            invocation.return_value(GLib.Variant("(b)", (ready,)))
         else:
             invocation.return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", "Unbekannte Methode.")
 

@@ -12,6 +12,8 @@ export WAYLAND_DISPLAY="diktate-smoke-$$"
 export GDK_BACKEND=wayland
 export DIKTATE_TEST_ARTIFACTS="$project_dir/.test-artifacts"
 mkdir -p "$DIKTATE_TEST_ARTIFACTS" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME"
+printf 'XDG_PICTURES_DIR="%s/pictures"\n' "$test_root" > "$XDG_CONFIG_HOME/user-dirs.dirs"
+rm -f "$DIKTATE_TEST_ARTIFACTS/client-screenshot.json"
 rm -f "$DIKTATE_TEST_ARTIFACTS/client.json" "$DIKTATE_TEST_ARTIFACTS/shell.json" "$DIKTATE_TEST_ARTIFACTS/shell-error.txt" "$DIKTATE_TEST_ARTIFACTS/submitted.json"
 mkdir -p "$XDG_DATA_HOME/gnome-shell/extensions/diktate-to-cursor@local" "$XDG_DATA_HOME/gnome-shell/extensions/diktate-smoke@local"
 cp -r gnome-extension/* "$XDG_DATA_HOME/gnome-shell/extensions/diktate-to-cursor@local/"
@@ -31,7 +33,7 @@ client_pid=$!
 gnome-shell --headless --virtual-monitor 1280x720 --wayland --wayland-display "$WAYLAND_DISPLAY" --no-x11 > "$DIKTATE_TEST_ARTIFACTS/shell.log" 2>&1 &
 shell_pid=$!
 trap '\''kill "$client_pid" "$shell_pid" 2>/dev/null || true'\'' EXIT
-for ((i=0;i<250;i++)); do
+for ((i=0;i<450;i++)); do
     if [ -f "$DIKTATE_TEST_ARTIFACTS/shell.json" ]; then
         cat "$DIKTATE_TEST_ARTIFACTS/shell.json"
         cat "$DIKTATE_TEST_ARTIFACTS/client.json"

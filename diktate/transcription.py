@@ -23,9 +23,12 @@ from .commands import DictationCommands
 SAMPLE_RATE = 16000
 BYTES_PER_SECOND = SAMPLE_RATE * 2
 FRAME_BYTES = 3200  # 100 ms, mono PCM16
+CAPTURE_BYTES = 640  # 20 ms: deliver microphone audio without a large input buffer.
 MAX_RECORDING_BYTES = BYTES_PER_SECOND * 60 * 30
 LIVE_FLUSH_BYTES = BYTES_PER_SECOND * 2
 AUTO_STOP_SECONDS = 30
+STARTUP_WINDOW_BYTES = BYTES_PER_SECOND // 10  # 100 ms of stable audio before ready.
+MAX_STARTUP_BYTES = BYTES_PER_SECOND * 3
 logger = logging.getLogger(__name__)
 
 
@@ -35,6 +38,44 @@ class TranscriptionError(Exception):
 
 class AuthenticationError(TranscriptionError):
     pass
+
+
+class CaptureStartup:
+    """Keep the first clean window; reject a microphone's power-on DC transient."""
+
+    def __init__(self):
+        self.pending = bytearray()
+        self.received_bytes = 0
+
+    def feed(self, frame: bytes) -> bytes:
+        self.received_bytes += len(frame)
+        self.pending.extend(frame)
+        # Keep sample alignment even if a pipe read splits a PCM16 sample.
+        excess = max(0, (len(self.pending) - STARTUP_WINDOW_BYTES) // 2 * 2)
+        if excess:
+            del self.pending[:excess]
+        if len(self.pending) < STARTUP_WINDOW_BYTES:
+            return b""
+        samples = struct.unpack(f"<{STARTUP_WINDOW_BYTES // 2}h",
+                                self.pending[:STARTUP_WINDOW_BYTES])
+        # DC offset and clipping, not silence: normal speech may be present.
+        dc_offset = abs(sum(samples) / len(samples))
+        clipped = sum(abs(sample) >= 32700 for sample in samples)
+        dc_transient = False
+        for start in range(0, len(samples), CAPTURE_BYTES // 2):
+            block = samples[start:start + CAPTURE_BYTES // 2]
+            mean = sum(block) / len(block)
+            ac_rms = math.sqrt(sum((sample - mean) ** 2 for sample in block) / len(block))
+            # A quiet tail must not conceal a constant offset at the window's start.
+            # Alternating speech, including low voices, is not a DC transient.
+            if abs(mean) > 512 and abs(mean) > 2 * ac_rms:
+                dc_transient = True
+                break
+        if not dc_transient and dc_offset <= 512 and clipped / len(samples) <= 0.001:
+            return bytes(self.pending)
+        if self.received_bytes >= MAX_STARTUP_BYTES:
+            raise TranscriptionError("Mikrofon liefert kein stabiles Signal. Bitte Eingangspegel und Mikrofonquelle prüfen.")
+        return b""
 
 
 def wav_bytes(pcm: bytes) -> bytes:
@@ -79,6 +120,7 @@ class Session:
         self.transcript = Transcript([])
         self.audio = bytearray()
         self.stop_requested = threading.Event()
+        self.submit_on_finish = False
         self.ended = False
         self.process = None
         self.loop = None
@@ -87,10 +129,13 @@ class Session:
         self.commands = DictationCommands()
         self.transport = "chunks" if config.mode == "chunks" else "streaming"
         self.chunk_words = []
-        self.last_speech_at = time.monotonic()
+        self.started_at = time.monotonic()
+        self.capture_ready = False
+        self.last_speech_at = self.started_at
         self.last_speech_audio_end = -1.0
 
-    def stop(self):
+    def stop(self, submit=False):
+        self.submit_on_finish = self.submit_on_finish or submit
         self.stop_requested.set()
         if self.loop and not self.loop.is_closed():
             self.loop.call_soon_threadsafe(self._terminate_capture)
@@ -115,7 +160,7 @@ class Session:
             logger.info("Aufnahme beendet: %.1f Sekunden, %d erkannte Zeichen", len(self.audio) / BYTES_PER_SECOND, len(self.transcript.text))
             # Also preserve partial text after a network or microphone error.
             self.emit("Finished", self.transcript.text)
-            if succeeded and self.commands.submit_requested:
+            if succeeded and (self.commands.submit_requested or self.submit_on_finish):
                 self.emit("SubmitRequested")
             self.emit("StateChanged", "idle", "")
             self.audio.clear()
@@ -128,6 +173,8 @@ class Session:
         capture = asyncio.create_task(self._capture())
         silence_watch = asyncio.create_task(self._watch_silence())
         try:
+            # Launch the microphone process before TLS/connection setup does work.
+            await asyncio.sleep(0)
             if self.config.mode == "chunks":
                 self.emit("StateChanged", "recording", "chunks")
                 await self._chunks(0)
@@ -196,20 +243,34 @@ class Session:
             await asyncio.sleep(min(0.25, AUTO_STOP_SECONDS - silence))
 
     async def _capture(self):
+        startup = CaptureStartup()
         try:
             self.process = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
-                "-f", "pulse", "-i", self.config.microphone,
-                "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "pipe:1",
+                "-f", "pulse", "-sample_rate", str(SAMPLE_RATE), "-channels", "1",
+                "-fragment_size", str(CAPTURE_BYTES), "-probesize", "32", "-analyzeduration", "0",
+                "-i", self.config.microphone,
+                "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "-flush_packets", "1", "pipe:1",
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
             )
             if self.stop_requested.is_set():
                 self._terminate_capture()
             while True:
-                frame = await self.process.stdout.read(FRAME_BYTES)
+                frame = await self.process.stdout.read(CAPTURE_BYTES)
                 if not frame:
                     break
-                self.audio.extend(frame)
+                if not self.capture_ready:
+                    frame = startup.feed(frame)
+                    if not frame:
+                        continue
+                    self.audio.extend(frame)
+                    self.capture_ready = True
+                    logger.info("Mikrofon stabil nach %.0f ms; %.0f ms Einschaltphase verworfen",
+                                (time.monotonic() - self.started_at) * 1000,
+                                (startup.received_bytes - len(frame)) / BYTES_PER_SECOND * 1000)
+                    self.emit("CaptureReady")
+                else:
+                    self.audio.extend(frame)
                 self.changed.set()
                 if len(self.audio) >= MAX_RECORDING_BYTES:
                     self.stop_requested.set()
@@ -218,6 +279,8 @@ class Session:
             code = await self.process.wait()
             if not self.stop_requested.is_set():
                 self.capture_error = TranscriptionError(f"Mikrofonaufnahme beendet (Code {code}). Bitte die Mikrofonquelle prüfen.")
+        except TranscriptionError as error:
+            self.capture_error = error
         except Exception:
             self.capture_error = TranscriptionError("Mikrofon konnte nicht geöffnet werden. FFmpeg und die Mikrofonquelle prüfen.")
         finally:
@@ -250,6 +313,8 @@ class Session:
             if error.response.status_code in (401, 403):
                 raise AuthenticationError("Deepgram-Schlüssel ungültig oder ohne Berechtigung.") from None
             raise
+        logger.info("Spracherkennung verbunden nach %.0f ms; %.0f ms Audio gepuffert",
+                    (time.monotonic() - self.started_at) * 1000, len(self.audio) / BYTES_PER_SECOND * 1000)
         self.emit("StateChanged", "finishing" if self.stop_requested.is_set() else "recording", "streaming")
         closing = False
         seen = set()

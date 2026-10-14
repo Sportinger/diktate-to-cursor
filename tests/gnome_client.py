@@ -18,6 +18,7 @@ buffer = None
 application = None
 clipboard_text = None
 toggle_count = 0
+capture_ready = False
 enter_count = 0
 
 
@@ -27,18 +28,41 @@ def emit(name, *args):
 
 
 def call(conn, sender, path, interface, method, args, invocation):
-    global state, toggle_count
+    global state, toggle_count, capture_ready
+    if method == 'TestScreenshotClipboard':
+        clipboard = Gdk.Display.get_default().get_clipboard()
+        def texture_ready(clipboard, result):
+            try:
+                texture = clipboard.read_texture_finish(result)
+                data = {'width': texture.get_width(), 'height': texture.get_height()}
+                (artifacts / 'client-screenshot.json').write_text(json.dumps(data))
+                invocation.return_value(None)
+            except Exception as error:
+                invocation.return_dbus_error('io.github.diktate.TestError', str(error))
+        clipboard.read_texture_async(None, texture_ready)
+        return
     if method == "GetState":
         invocation.return_value(GLib.Variant("(ss)", (state, "streaming" if state != "idle" else "")))
         return
     if method == "GetSilence":
         invocation.return_value(GLib.Variant("(d)", (0.0,)))
         return
+    if method == "GetCaptureReady":
+        invocation.return_value(GLib.Variant("(b)", (capture_ready,)))
+        return
     if method == "Toggle":
         toggle_count += 1
         if state == "idle":
+            capture_ready = False
             state = "recording"
             emit("StateChanged", state, "streaming")
+            def ready():
+                global capture_ready
+                if state == 'recording':
+                    capture_ready = True
+                    emit('CaptureReady')
+                return GLib.SOURCE_REMOVE
+            GLib.timeout_add(250, ready)
             if toggle_count == 3:
                 def voice_submit():
                     global state
@@ -67,6 +91,18 @@ def call(conn, sender, path, interface, method, args, invocation):
             emit("Finished", "Hallo Welt. Noch ein Satz.")
             state = "idle"
             emit("StateChanged", state, "")
+    elif method == 'StopAndSubmit':
+        state = 'finishing'
+        emit('StateChanged', state, 'streaming')
+        def finish_keyboard_submit():
+            global state
+            emit('Final', ' Noch ein Satz.')
+            emit('Finished', 'Hallo Welt. Noch ein Satz.')
+            emit('SubmitRequested')
+            state = 'idle'
+            emit('StateChanged', state, '')
+            return GLib.SOURCE_REMOVE
+        GLib.timeout_add(150, finish_keyboard_submit)
     elif method == "Stop":
         state = "idle"
     invocation.return_value(None)
@@ -75,7 +111,8 @@ def call(conn, sender, path, interface, method, args, invocation):
 def acquired(conn, name):
     global connection
     connection = conn
-    node = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION)
+    node = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION.replace('</interface>',
+        '<method name="TestScreenshotClipboard"/></interface>'))
     connection.register_object(OBJECT_PATH, node.interfaces[0], call, None, None)
 
 
@@ -133,7 +170,11 @@ def check():
 
     def read(clipboard, result):
         global clipboard_text
-        clipboard_text = clipboard.read_text_finish(result)
+        try:
+            clipboard_text = clipboard.read_text_finish(result)
+        except GLib.Error:
+            # An image-only screenshot may replace the previous dictation.
+            return
         if clipboard_text == expected:
             (artifacts / "client.json").write_text(json.dumps({"text": text, "clipboard": clipboard_text, "toggles": toggle_count}))
 
@@ -142,6 +183,6 @@ def check():
 
 
 GLib.timeout_add(100, start_app)
-GLib.timeout_add_seconds(25, lambda: loop.quit() or GLib.SOURCE_REMOVE)
+GLib.timeout_add_seconds(45, lambda: loop.quit() or GLib.SOURCE_REMOVE)
 loop.run()
 Gio.bus_unown_name(owner)
