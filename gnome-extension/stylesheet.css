@@ -18,3 +18,7 @@
 .diktate-screenshot-selection {
     background-color: rgba(0, 0, 0, 0.16);
 }
+.diktate-hint {
+    font-size: 16px;
+    color: rgba(255, 255, 255, 0.72);
+}

@@ -67,9 +67,15 @@ Run the installer as your regular user, without sudo. It creates a Python enviro
 
 `^` is reserved while the extension is enabled. The default binding is designed for a German keyboard; if your layout does not produce a caret or dead circumflex directly, customize the `diktate-toggle-recording` GSettings binding in the extension schema.
 
-Pressing `^` to stop never submits the text. Enter is intercepted only during recording, and submission happens only after the final words are inserted. Shift+Enter and normal Enter outside recording retain their usual behavior. Recording errors do not automatically submit.
+Pressing `^` to stop never submits the text. Enter is intercepted only during recording and only while the window where you started dictating has focus; submission happens only after the final words are inserted. Shift+Enter, Enter in other windows, and normal Enter outside recording retain their usual behavior. Recording errors do not automatically submit.
 
-The tool follows the current text focus. Switching fields also switches where later text goes. It pauses pasting while modifiers, menus, or the overview interfere. Ordinary applications receive Ctrl+V; recognized terminals receive Ctrl+Shift+V. Editor-embedded terminals and applications with custom paste shortcuts may need adjustments.
+Text stays with the window that had focus when you pressed `^`. If you click into another window to look something up, finished sentences wait instead of landing there, and the overlay shows **wartet auf ‹App›**. When you return to that window, the waiting text is pasted in order, followed by a pending Enter. Meanwhile the clipboard holds the full dictation so far as a backup, unless you copied something else in the meantime. A dictation that is still waiting after you stop turns the microphone icon light blue. If the start window is closed, nothing is pasted elsewhere: the text stays on the clipboard and a notification says so. Within the start window, switching text fields still moves later text there. If no window had focus at the start, text follows the current focus.
+
+The tool pauses pasting while modifiers, menus, or the overview interfere. Ordinary applications receive Ctrl+V; recognized terminals receive Ctrl+Shift+V. Editor-embedded terminals and applications with custom paste shortcuts may need adjustments.
+
+### Optional: Raster terminal
+
+If dictation starts in a Raster window (a tiling terminal for Claude Code and Codex sessions) and the `raster` command is installed (on `PATH` or in `~/.local/bin`), the extension asks Raster which tile has keyboard focus and types the text straight into that tile with `raster type`, without changing focus. You can keep working in another app or tile while the text arrives in the original tile; a spoken or physical Enter also goes to that tile. Enter pressed in a different tile of the Raster window stays an ordinary Enter for that tile. If Raster cannot be reached, dictation falls back to the window behavior above. Nothing changes when Raster is not installed. `DIKTATE_RASTER_BIN` in the GNOME Shell environment overrides the command path.
 
 ## Screenshots
 
@@ -125,10 +131,12 @@ The Python service handles recording, transcription, fallback, and state. The GN
 node --check gnome-extension/extension.js
 node --check gnome-extension/prefs.js
 node --check gnome-extension/screenshot.js
+node --check gnome-extension/delivery.js
+node --check gnome-extension/raster.js
 bash tests/gnome_smoke.sh  # Isolated GNOME 50 Wayland session, mocked service
 ```
 
-The integration test uses a separate desktop and synthetic text. It tests hotkeys, overlay states, paste-before-Enter ordering, screenshots, and cleanup. It does not use your microphone or a Deepgram key. See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
+The integration test uses a separate desktop and synthetic text. It tests hotkeys, overlay states, paste-before-Enter ordering, text waiting for its start window, Enter outside the start window, a closed start window, the Raster tile path against a stand-in `raster` command (`tests/fake_raster.py`), screenshots, and cleanup. It does not use your microphone or a Deepgram key. See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
 ## License
 

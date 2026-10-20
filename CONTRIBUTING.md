@@ -13,6 +13,8 @@ python3 -m venv --system-site-packages .venv
 node --check gnome-extension/extension.js
 node --check gnome-extension/prefs.js
 node --check gnome-extension/screenshot.js
+node --check gnome-extension/delivery.js
+node --check gnome-extension/raster.js
 ```
 
 GNOME changes should also pass `bash tests/gnome_smoke.sh` on GNOME 50. It creates an isolated Wayland session and mocked D-Bus service. Its output and screenshots stay in ignored `.test-artifacts/`.

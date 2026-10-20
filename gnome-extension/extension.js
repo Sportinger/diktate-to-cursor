@@ -11,6 +11,8 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as BoxPointer from 'resource:///org/gnome/shell/ui/boxpointer.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
+import {Delivery} from './delivery.js';
+import {RasterBridge} from './raster.js';
 import {ScreenshotController} from './screenshot.js';
 
 const BUS = 'io.github.diktate.Cursor';
@@ -35,9 +37,11 @@ export default class DiktateExtension extends Extension {
         this._readyFlashUntil = 0;
         this._mode = '';
         this._lastText = '';
-        this._pendingClipboard = null;
-        this._pasteQueue = [];
-        this._submitPending = false;
+        // One Delivery per recording: its start window, queued segments and pending Enter.
+        this._deliveries = [];
+        this._current = null;
+        this._ownClipboard = null;
+        this._waitingText = '';
         this._timeouts = new Set();
         this._stopAnimation = [];
         this._closingOverlay = false;
@@ -48,6 +52,7 @@ export default class DiktateExtension extends Extension {
         this._screenshots = new ScreenshotController(this._settings,
             saved => this._screenshotPathItem.setSensitive(saved));
         this._cancellable = new Gio.Cancellable();
+        this._raster = new RasterBridge(this._cancellable);
         const backend = global.stage.context?.get_backend() ?? Clutter.get_default_backend();
         this._keyboard = backend.get_default_seat()
             .create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
@@ -128,10 +133,16 @@ export default class DiktateExtension extends Extension {
         this._preview = new St.Label({text: '', style_class: 'diktate-preview', x_align: Clutter.ActorAlign.CENTER});
         this._preview.clutter_text.line_wrap = true;
         this._preview.clutter_text.ellipsize = Pango.EllipsizeMode.END;
+        this._hint = new St.Label({text: '', style_class: 'diktate-hint', x_align: Clutter.ActorAlign.CENTER, visible: false});
+        this._overlay.add_child(this._hint);
         this._overlay.add_child(this._title);
         this._overlay.add_child(this._preview);
         Main.layoutManager.addChrome(this._overlay, {trackFullscreen: false});
         this._monitorSignal = Main.layoutManager.connect('monitors-changed', () => this._positionOverlay());
+        this._focusSignal = global.display.connect('notify::focus-window', () => {
+            this._updateEnterBinding();
+            this._updateWaiting();
+        });
 
         // Mutter grabs and consumes the key before it reaches any Wayland/X11 app.
         // IGNORE_AUTOREPEAT ensures holding ^ does not toggle repeatedly.
@@ -261,9 +272,7 @@ export default class DiktateExtension extends Extension {
     }
 
     _toggle() {
-        if (this._state === 'finishing' ||
-            (this._state === 'idle' && (this._pendingClipboard !== null || this._pasteQueue.length ||
-                this._pasting || this._submitPending)))
+        if (this._state === 'finishing' || (this._state === 'idle' && this._pasting))
             return;
         this._button.menu.close();
         if (this._state === 'recording')
@@ -277,7 +286,7 @@ export default class DiktateExtension extends Extension {
         else if (signal === 'Interim' && this._state === 'recording' && !this._closingOverlay)
             this._preview.text = args[0].slice(-180);
         else if (signal === 'Final')
-            this._pasteQueue.push(args[0]);
+            this._signalDelivery().add(args[0]);
         else if (signal === 'SilenceChanged')
             this._setSilence(args[0]);
         else if (signal === 'CaptureReady')
@@ -285,9 +294,9 @@ export default class DiktateExtension extends Extension {
         else if (signal === 'Finished') {
             this._lastText = args[0];
             this._copyItem.setSensitive(Boolean(this._lastText));
-            this._pendingClipboard = this._lastText;
+            this._signalDelivery().finish(this._lastText);
         } else if (signal === 'SubmitRequested') {
-            this._submitPending = true;
+            this._signalDelivery().submit = true;
         } else if (signal === 'Error' || signal === 'Notice') {
             Main.notify('Diktate to Cursor', args[0]);
         }
@@ -297,16 +306,16 @@ export default class DiktateExtension extends Extension {
         if (!this._enabled)
             return;
         const starting = state === 'recording' && this._state === 'idle';
+        const ended = state === 'idle' && this._state !== 'idle';
         this._state = state;
         this._mode = mode;
-        if (state === 'recording' && !this._enterBinding) {
-            const action = Main.wm.addKeybinding('diktate-stop-and-submit', this.getSettings(),
-                Meta.KeyBindingFlags.IGNORE_AUTOREPEAT, Shell.ActionMode.NORMAL, () => this._stopAndSubmit());
-            this._enterBinding = action !== Meta.KeyBindingAction.NONE;
-        } else if (state !== 'recording' && this._enterBinding) {
-            Main.wm.removeKeybinding('diktate-stop-and-submit');
-            this._enterBinding = false;
+        if (starting)
+            this._beginDelivery();
+        if (ended && this._current) {
+            this._current.recording = false;
+            this._current = null;
         }
+        this._updateEnterBinding();
         if (starting) {
             this._captureReady = false;
             this._readyFlashUntil = 0;
@@ -326,11 +335,9 @@ export default class DiktateExtension extends Extension {
             });
         }
         const recording = state === 'recording';
-        this._icon.set_style(recording ? 'color: #ff4545;' : state === 'finishing' ? 'color: #ffbd59;' : null);
         this._toggleItem.label.text = recording ? 'Aufnahme stoppen  ·  ^' : state === 'finishing' ? 'Diktat wird abgeschlossen …' : 'Aufnahme starten  ·  ^';
         this._toggleItem.setSensitive(state !== 'finishing');
-        const transport = mode === 'streaming' ? 'Live-Streaming' : mode === 'chunks' ? 'Kurze Abschnitte' : 'Verbinde …';
-        this._statusItem.label.text = state === 'idle' ? 'Bereit' : transport;
+        this._updateWaiting(true);
         if (recording && !this._closingOverlay) {
             this._title.text = this._captureReady ? LISTENING_TEXT : STARTING_TEXT;
             this._overlay.show();
@@ -359,6 +366,7 @@ export default class DiktateExtension extends Extension {
         if (this._closingOverlay)
             return;
         this._closingOverlay = true;
+        this._hint.hide();
         this._readyFlashUntil = 0;
         this._resetPauseVisual();
         const text = this._title.text || (this._captureReady ? LISTENING_TEXT : STARTING_TEXT);
@@ -445,8 +453,10 @@ export default class DiktateExtension extends Extension {
     }
 
     _setClipboard(text) {
-        if (text)
-            St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, text);
+        if (!text)
+            return;
+        St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, text);
+        this._ownClipboard = text;
     }
 
     _later(milliseconds, callback) {
@@ -460,16 +470,71 @@ export default class DiktateExtension extends Extension {
         return id;
     }
 
+    _beginDelivery() {
+        if (this._current)
+            this._current.recording = false;
+        // Text goes where the user started dictating, even after clicking elsewhere.
+        this._current = new Delivery(global.display.focus_window, this._raster);
+        this._deliveries.push(this._current);
+    }
+
+    _signalDelivery() {
+        if (!this._current) {
+            // A late signal without a running recording follows the focus as before.
+            const delivery = new Delivery(null, this._raster);
+            delivery.recording = false;
+            this._deliveries.push(delivery);
+            return delivery;
+        }
+        return this._current;
+    }
+
     _drainPaste() {
+        for (const delivery of this._deliveries) {
+            if (delivery.mode === 'raster')
+                this._drainRaster(delivery);
+            else if (delivery.mode === 'clipboard')
+                this._drainClipboard(delivery);
+        }
+        this._drainWindows();
+        this._deliveries = this._deliveries.filter(delivery => {
+            if (!delivery.done)
+                return true;
+            delivery.destroy();
+            return false;
+        });
+        this._updateEnterBinding();
+        this._updateWaiting();
+    }
+
+    _drainWindows() {
         if (this._pasting)
             return;
-        if (!this._pasteQueue.length) {
-            if (this._pendingClipboard !== null) {
-                this._setClipboard(this._pendingClipboard);
-                this._pendingClipboard = null;
+        for (const delivery of this._deliveries) {
+            if (delivery.mode !== 'window')
+                continue;
+            if (!delivery.focused) {
+                // Never paste into another window; keep the text so far on the clipboard instead.
+                this._backupClipboard(delivery);
+                continue;
             }
-            if (this._submitPending && this._canType()) {
-                this._submitPending = false;
+            if (delivery.hasWork) {
+                // Older dictations for the same window go first, one paste at a time.
+                this._pasteNext(delivery);
+                return;
+            }
+        }
+    }
+
+    _pasteNext(delivery) {
+        if (!delivery.queue.length) {
+            if (delivery.finalText !== null) {
+                this._setClipboard(delivery.finalText);
+                delivery.finalText = null;
+                delivery.backupDirty = false;
+            }
+            if (delivery.submit && this._canType()) {
+                delivery.submit = false;
                 const time = GLib.get_monotonic_time();
                 this._keyboard.notify_keyval(time, Clutter.KEY_Return, Clutter.KeyState.PRESSED);
                 this._keyboard.notify_keyval(time, Clutter.KEY_Return, Clutter.KeyState.RELEASED);
@@ -479,17 +544,19 @@ export default class DiktateExtension extends Extension {
         // Wait while a menu, lock screen, overview, or held modifier owns input.
         if (!this._canType()) {
             // The completed dictation must be available even without a text field.
-            if (this._pendingClipboard !== null)
-                this._setClipboard(this._pendingClipboard);
+            if (delivery.finalText !== null && delivery.backupDirty) {
+                delivery.backupDirty = false;
+                this._setClipboard(delivery.finalText);
+            }
             return;
         }
         this._pasting = true;
-        this._currentInsertion = this._pasteQueue.shift();
-        this._setClipboard(this._currentInsertion);
+        const insertion = delivery.queue.shift();
+        this._setClipboard(insertion);
         this._later(35, () => {
-            if (!this._canType()) {
+            if (!this._canType() || delivery.mode !== 'window' || !delivery.focused) {
                 // Clipboard still holds this segment; postpone the paste without dropping it.
-                this._pasteQueue.unshift(this._currentInsertion);
+                delivery.queue.unshift(insertion);
                 this._pasting = false;
                 return;
             }
@@ -508,6 +575,144 @@ export default class DiktateExtension extends Extension {
             // Leave the segment available long enough for the application to request it.
             this._later(180, () => { this._pasting = false; });
         });
+    }
+
+    _drainRaster(delivery) {
+        if (delivery.busy)
+            return;
+        if (delivery.queue.length) {
+            delivery.busy = true;
+            this._raster.type(delivery.pane, delivery.queue[0]).then(ok => {
+                delivery.busy = false;
+                if (!this._enabled)
+                    return;
+                if (!ok) {
+                    this._rasterFailed(delivery);
+                    return;
+                }
+                delivery.queue.shift();
+                this._backupClipboard(delivery);
+            });
+            return;
+        }
+        if (delivery.finalText !== null) {
+            delivery.finalText = null;
+            this._backupClipboard(delivery);
+        }
+        if (delivery.submit) {
+            delivery.busy = true;
+            delivery.submit = false;
+            this._raster.type(delivery.pane, '', true).then(ok => {
+                delivery.busy = false;
+                if (this._enabled && !ok) {
+                    delivery.submit = true;
+                    this._rasterFailed(delivery);
+                }
+            });
+        }
+    }
+
+    _rasterFailed(delivery) {
+        delivery.fallBack();
+        if (delivery.mode === 'window' && !delivery.noticeShown) {
+            delivery.noticeShown = true;
+            Main.notify('Diktate to Cursor', 'Raster ist nicht erreichbar. Der Text wird eingefügt, sobald das Raster-Fenster aktiv ist.');
+        }
+    }
+
+    _drainClipboard(delivery) {
+        // The start window is gone: pasting elsewhere would put the text in the wrong place.
+        if (delivery.queue.length && !delivery.noticeShown) {
+            delivery.noticeShown = true;
+            Main.notify('Diktate to Cursor', 'Das Startfenster wurde geschlossen. Der Text liegt in der Zwischenablage.');
+        }
+        if (delivery.hasWork) {
+            delivery.queue = [];
+            delivery.submit = false;
+            delivery.finalText = null;
+            delivery.backupDirty = true;
+        }
+        if (delivery.backupDirty) {
+            delivery.backupDirty = false;
+            this._setClipboard(delivery.text);
+        }
+    }
+
+    _backupClipboard(delivery) {
+        if (!delivery.backupDirty || !delivery.text)
+            return;
+        delivery.backupDirty = false;
+        const text = delivery.text;
+        St.Clipboard.get_default().get_text(St.ClipboardType.CLIPBOARD, (_clipboard, current) => {
+            // Never replace something the user copied during the dictation.
+            if (this._enabled && (current === this._ownClipboard || current === delivery.clipboardAtStart))
+                this._setClipboard(text);
+        });
+    }
+
+    _updateEnterBinding() {
+        // Physical Enter submits only in the window that receives the dictation; elsewhere it stays an ordinary key.
+        const wanted = this._enabled && this._state === 'recording' && (!this._current || this._current.focused);
+        if (wanted && !this._enterBinding) {
+            const action = Main.wm.addKeybinding('diktate-stop-and-submit', this.getSettings(),
+                Meta.KeyBindingFlags.IGNORE_AUTOREPEAT, Shell.ActionMode.NORMAL, () => this._onEnter());
+            this._enterBinding = action !== Meta.KeyBindingAction.NONE;
+        } else if (!wanted && this._enterBinding) {
+            Main.wm.removeKeybinding('diktate-stop-and-submit');
+            this._enterBinding = false;
+        }
+    }
+
+    _onEnter() {
+        const delivery = this._current;
+        if (delivery?.mode !== 'raster') {
+            this._stopAndSubmit();
+            return;
+        }
+        // Enter in another Raster tile belongs to that tile; only the dictation tile submits.
+        this._raster.focused().then(pane => {
+            if (!this._enabled)
+                return;
+            if (pane && pane.id !== delivery.pane)
+                this._raster.type(pane.id, '', true);
+            else
+                this._stopAndSubmit();
+        });
+    }
+
+    _waitingHint() {
+        const delivery = this._current;
+        if (delivery) {
+            if (delivery.mode === 'clipboard')
+                return 'Startfenster geschlossen · Text in der Zwischenablage';
+            if (delivery.mode === 'raster' && global.display.focus_window !== delivery.window)
+                return `schreibt in ${delivery.label}`;
+            if (delivery.mode === 'window' && !delivery.focused)
+                return `wartet auf ${delivery.label}`;
+            return '';
+        }
+        const waiting = this._deliveries.find(item => item.mode === 'window' && item.hasWork && !item.focused);
+        return waiting ? `Text wartet auf ${waiting.label}` : '';
+    }
+
+    _updateWaiting(force = false) {
+        if (!this._hint)
+            return;
+        const hint = this._waitingHint();
+        if (!this._closingOverlay) {
+            if (this._hint.text !== hint)
+                this._hint.text = hint;
+            this._hint.visible = Boolean(hint);
+        }
+        const waiting = this._state === 'idle' ? hint : '';
+        if (!force && waiting === this._waitingText)
+            return;
+        this._waitingText = waiting;
+        const state = this._state;
+        this._icon.set_style(state === 'recording' ? 'color: #ff4545;' : state === 'finishing' ? 'color: #ffbd59;'
+            : waiting ? 'color: #8ab4f8;' : null);
+        const transport = this._mode === 'streaming' ? 'Live-Streaming' : this._mode === 'chunks' ? 'Kurze Abschnitte' : 'Verbinde …';
+        this._statusItem.label.text = state === 'idle' ? waiting || 'Bereit' : transport;
     }
 
     _canType() {
@@ -539,14 +744,18 @@ export default class DiktateExtension extends Extension {
             Main.wm.removeKeybinding('diktate-stop-and-submit');
         if (this._monitorSignal)
             Main.layoutManager.disconnect(this._monitorSignal);
+        if (this._focusSignal)
+            global.display.disconnect(this._focusSignal);
+        for (const delivery of this._deliveries ?? [])
+            delivery.destroy();
         this._overlay?.destroy();
         this._button?.destroy();
         this._overlay = null;
         this._button = null;
         this._keyboard = null;
-        this._pasteQueue = [];
+        this._deliveries = [];
+        this._current = null;
         this._pasting = false;
-        this._submitPending = false;
         this._stopAnimation = [];
     }
 }

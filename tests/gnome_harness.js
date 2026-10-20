@@ -189,6 +189,159 @@ export default class Harness extends Extension {
             keyboardSubmitted.text !== 'Hallo Welt. Noch ein Satz.')
             throw new Error(`Physical Enter did not finish and submit once: ${JSON.stringify(keyboardSubmitted)}`);
 
+        // Dictation stays with the window where it started, even after clicking elsewhere.
+        const readJson = name => JSON.parse(new TextDecoder().decode(
+            Gio.File.new_for_path(`${path}/${name}`).load_contents(null)[1]));
+        const clipboardText = () => new Promise(resolve =>
+            St.Clipboard.get_default().get_text(St.ClipboardType.CLIPBOARD, (_clipboard, text) => resolve(text)));
+        const findWindow = async title => {
+            for (let i = 0; i < 60; i++) {
+                const found = global.display.list_all_windows().find(window => window.get_title() === title);
+                if (found)
+                    return found;
+                await wait(100);
+            }
+            throw new Error(`Window did not appear: ${title}`);
+        };
+        const focusWindow = async window => {
+            for (let i = 0; i < 30 && global.display.focus_window !== window; i++) {
+                window.activate(global.get_current_time());
+                await wait(60);
+            }
+            if (global.display.focus_window !== window)
+                throw new Error(`Could not focus ${window.get_title()}`);
+        };
+        const until = async (check, message) => {
+            for (let i = 0; i < 40; i++) {
+                if (check())
+                    return;
+                await wait(100);
+            }
+            throw new Error(message());
+        };
+        const rasterLog = () => {
+            const file = Gio.File.new_for_path(`${path}/raster.jsonl`);
+            if (!file.query_exists(null))
+                return [];
+            return new TextDecoder().decode(file.load_contents(null)[1]).trim().split('\n').map(line => JSON.parse(line));
+        };
+        const setRasterFocus = pane => GLib.file_set_contents(`${path}/raster-focus.txt`, pane);
+        const pressReturn = () => {
+            keyval(Clutter.KEY_Return, Clutter.KeyState.PRESSED);
+            keyval(Clutter.KEY_Return, Clutter.KeyState.RELEASED);
+        };
+        const startWindow = global.display.focus_window;
+        extension._call('TestOpenWindows');
+        const otherWindow = await findWindow('Diktate other window');
+        const rasterWindow = await findWindow('Fake Raster');
+        // New windows take focus once they are first drawn; let that settle.
+        await wait(1500);
+        await focusWindow(startWindow);
+        keyval(Clutter.KEY_Control_L, Clutter.KeyState.PRESSED);
+        keyval(Clutter.KEY_a, Clutter.KeyState.PRESSED);
+        keyval(Clutter.KEY_a, Clutter.KeyState.RELEASED);
+        keyval(Clutter.KEY_Control_L, Clutter.KeyState.RELEASED);
+        keyval(Clutter.KEY_BackSpace, Clutter.KeyState.PRESSED);
+        keyval(Clutter.KEY_BackSpace, Clutter.KeyState.RELEASED);
+        await wait(200);
+        await press();
+        await focusWindow(otherWindow);
+        await wait(1500);
+        let seen = readJson('client-state.json');
+        if (seen.text !== '' || seen.other !== '' || extension._current?.queue.length !== 1)
+            throw new Error(`Dictation was pasted into the wrong window: ${JSON.stringify(seen)}`);
+        if (!extension._hint.visible || !extension._hint.text.startsWith('wartet auf '))
+            throw new Error(`Waiting hint missing: ${extension._hint.text}`);
+        if (extension._enterBinding || await clipboardText() !== 'Hallo Welt.')
+            throw new Error('Waiting dictation captured Enter elsewhere or did not keep the clipboard backup');
+        pressReturn();
+        await wait(300);
+        seen = readJson('client-state.json');
+        if (extension._state !== 'recording' || seen.other !== '\n')
+            throw new Error(`Enter in another window was taken as submit: ${JSON.stringify(seen)}, ${extension._state}, ${extension._enterBinding}, ${global.display.focus_window?.get_title()}`);
+        await press();
+        await wait(900);
+        seen = readJson('client-state.json');
+        if (extension._state !== 'idle' || seen.text !== '' || !extension._icon.get_style()?.includes('#8ab4f8') ||
+            !extension._statusItem.label.text.startsWith('Text wartet auf '))
+            throw new Error(`Stopped dictation did not wait calmly: ${JSON.stringify(seen)}, ${extension._statusItem.label.text}`);
+        if (await clipboardText() !== 'Hallo Welt. Noch ein Satz.')
+            throw new Error('Clipboard backup does not hold the full dictation');
+        await focusWindow(startWindow);
+        await until(() => readJson('client-state.json').text === 'Hallo Welt. Noch ein Satz.',
+            () => `Waiting dictation was not pasted on return: ${JSON.stringify(readJson('client-state.json'))}`);
+        await until(() => !extension._deliveries.length && !extension._icon.get_style(),
+            () => 'Delivered dictation did not clear the waiting state');
+        if (readJson('client-state.json').other !== '\n')
+            throw new Error('Other window received dictated text');
+
+        // Raster: text goes straight into the tile that had focus, wherever the focus is now.
+        setRasterFocus('pane-1');
+        await focusWindow(rasterWindow);
+        await press();
+        await wait(100);
+        await focusWindow(otherWindow);
+        await until(() => rasterLog().length === 1, () => `Raster tile got no text: ${JSON.stringify(rasterLog())}`);
+        let entry = rasterLog()[0];
+        if (entry.pane !== 'pane-1' || entry.text !== 'Hallo Welt.' || entry.enter || entry.pane_env !== null)
+            throw new Error(`Incorrect Raster delivery: ${JSON.stringify(entry)}`);
+        if (extension._current?.mode !== 'raster' || !extension._hint.text.startsWith('schreibt in Raster'))
+            throw new Error(`Raster target not shown: ${extension._current?.mode}, ${extension._hint.text}`);
+        pressReturn();
+        await wait(300);
+        if (extension._state !== 'recording' || readJson('client-state.json').other !== '\n\n')
+            throw new Error('Enter outside Raster was captured');
+        await focusWindow(rasterWindow);
+        setRasterFocus('pane-2');
+        await wait(150);
+        pressReturn();
+        await until(() => rasterLog().length === 2, () => 'Enter in another tile was not forwarded');
+        entry = rasterLog()[1];
+        if (entry.pane !== 'pane-2' || entry.text !== '' || !entry.enter || extension._state !== 'recording')
+            throw new Error(`Enter in another tile was misrouted: ${JSON.stringify(entry)}`);
+        setRasterFocus('pane-1');
+        pressReturn();
+        await until(() => rasterLog().length === 4, () => `Raster submit incomplete: ${JSON.stringify(rasterLog())}`);
+        const [, finalEntry, submitEntry] = rasterLog().slice(1);
+        if (finalEntry.pane !== 'pane-1' || finalEntry.text !== ' Noch ein Satz.' || finalEntry.enter ||
+            submitEntry.pane !== 'pane-1' || submitEntry.text !== '' || !submitEntry.enter)
+            throw new Error(`Raster submit misrouted: ${JSON.stringify(rasterLog())}`);
+        await wait(200);
+        seen = readJson('client-state.json');
+        if (extension._state !== 'idle' || extension._enterBinding || seen.text !== 'Hallo Welt. Noch ein Satz.' ||
+            seen.other !== '\n\n' || await clipboardText() !== 'Hallo Welt. Noch ein Satz.')
+            throw new Error(`Raster dictation leaked into windows: ${JSON.stringify(seen)}`);
+
+        // Raster unreachable: fall back to waiting for the Raster window.
+        GLib.file_set_contents(`${path}/raster-fail.txt`, '1');
+        await press();
+        const fallback = extension._current;
+        await until(() => fallback.mode === 'window' && fallback.noticeShown,
+            () => `No fallback when Raster fails: ${fallback.mode}`);
+        await press();
+        await until(() => !extension._deliveries.length, () => 'Fallback dictation was not delivered to the Raster window');
+        Gio.File.new_for_path(`${path}/raster-fail.txt`).delete(null);
+        if (rasterLog().length !== 4 || readJson('client-state.json').text !== 'Hallo Welt. Noch ein Satz.')
+            throw new Error('Fallback dictation went elsewhere');
+
+        // The start window closes: never paste into another window, keep the text on the clipboard.
+        await focusWindow(otherWindow);
+        await press();
+        await focusWindow(startWindow);
+        otherWindow.delete(global.get_current_time());
+        await until(() => !global.display.list_all_windows().includes(otherWindow), () => 'Other window did not close');
+        await wait(1500);
+        if (extension._current?.mode !== 'clipboard' || extension._enterBinding ||
+            !extension._hint.text.startsWith('Startfenster geschlossen') || await clipboardText() !== 'Hallo Welt.')
+            throw new Error(`Closed start window not handled: ${extension._current?.mode}, ${extension._hint.text}`);
+        await press();
+        await wait(900);
+        if (readJson('client-state.json').text !== 'Hallo Welt. Noch ein Satz.' || extension._deliveries.length ||
+            await clipboardText() !== 'Hallo Welt. Noch ein Satz.')
+            throw new Error('Dictation for a closed window was pasted elsewhere');
+        rasterWindow.delete(global.get_current_time());
+        await focusWindow(startWindow);
+
         const screenshotHotkey = async () => {
             keyval(Clutter.KEY_Shift_L, Clutter.KeyState.PRESSED);
             keyval(Clutter.KEY_Alt_L, Clutter.KeyState.PRESSED);
@@ -350,7 +503,7 @@ export default class Harness extends Extension {
         }
         if (!client.text.endsWith('^'))
             throw new Error(`Caret did not work after disabling the extension: ${client.text}`);
-        GLib.file_set_contents(`${path}/shell.json`, JSON.stringify({screenshotFrozenPreview: true, screenshotFrozenCrop: true, screenshotFullResolution: true, screenshotCompact: true, screenshotScreen: true, screenshotCrop: true, screenshotImageClipboard: true, screenshotPath: true, screenshotCancel: true, screenshotDisable: true, physicalEnterSubmit: true, rightClickLanguage: true, hotkey: true, noAutorepeat: true, recordingOverlay: true, greenReadyFlash: true, redIcon: true, pauseEffects: true, redPauseWarning: true, speechReset: true, stop: true, stopAnimation: true, hiddenWhileFinishing: true, enterAfterPaste: true, modifiersDeferred: true, preferences: true, restoredCaret: true}));
+        GLib.file_set_contents(`${path}/shell.json`, JSON.stringify({screenshotFrozenPreview: true, screenshotFrozenCrop: true, screenshotFullResolution: true, screenshotCompact: true, screenshotScreen: true, screenshotCrop: true, screenshotImageClipboard: true, screenshotPath: true, screenshotCancel: true, screenshotDisable: true, physicalEnterSubmit: true, stayWithStartWindow: true, enterOnlyInStartWindow: true, clipboardBackup: true, rasterTile: true, rasterEnterOtherTile: true, rasterFallback: true, closedStartWindow: true, rightClickLanguage: true, hotkey: true, noAutorepeat: true, recordingOverlay: true, greenReadyFlash: true, redIcon: true, pauseEffects: true, redPauseWarning: true, speechReset: true, stop: true, stopAnimation: true, hiddenWhileFinishing: true, enterAfterPaste: true, modifiersDeferred: true, preferences: true, restoredCaret: true}));
         console.log('DIKTATE SMOKE: PASS');
     }
 

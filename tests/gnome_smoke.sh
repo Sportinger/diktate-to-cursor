@@ -11,10 +11,14 @@ export XDG_STATE_HOME="$test_root/state"
 export WAYLAND_DISPLAY="diktate-smoke-$$"
 export GDK_BACKEND=wayland
 export DIKTATE_TEST_ARTIFACTS="$project_dir/.test-artifacts"
+# The optional Raster integration talks to a stand-in, never to a real Raster terminal.
+export DIKTATE_RASTER_BIN="$project_dir/tests/fake_raster.py"
+unset RASTER_SOCK RASTER_PANE_ID RASTER_PANE_KIND RASTER_PANE_ADDR
 mkdir -p "$DIKTATE_TEST_ARTIFACTS" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME"
 printf 'XDG_PICTURES_DIR="%s/pictures"\n' "$test_root" > "$XDG_CONFIG_HOME/user-dirs.dirs"
 rm -f "$DIKTATE_TEST_ARTIFACTS/client-screenshot.json"
 rm -f "$DIKTATE_TEST_ARTIFACTS/client.json" "$DIKTATE_TEST_ARTIFACTS/shell.json" "$DIKTATE_TEST_ARTIFACTS/shell-error.txt" "$DIKTATE_TEST_ARTIFACTS/submitted.json"
+rm -f "$DIKTATE_TEST_ARTIFACTS/raster.jsonl" "$DIKTATE_TEST_ARTIFACTS/raster-focus.txt" "$DIKTATE_TEST_ARTIFACTS/raster-fail.txt"
 mkdir -p "$XDG_DATA_HOME/gnome-shell/extensions/diktate-to-cursor@local" "$XDG_DATA_HOME/gnome-shell/extensions/diktate-smoke@local"
 cp -r gnome-extension/* "$XDG_DATA_HOME/gnome-shell/extensions/diktate-to-cursor@local/"
 glib-compile-schemas "$XDG_DATA_HOME/gnome-shell/extensions/diktate-to-cursor@local/schemas"
@@ -33,7 +37,7 @@ client_pid=$!
 gnome-shell --headless --virtual-monitor 1280x720 --wayland --wayland-display "$WAYLAND_DISPLAY" --no-x11 > "$DIKTATE_TEST_ARTIFACTS/shell.log" 2>&1 &
 shell_pid=$!
 trap '\''kill "$client_pid" "$shell_pid" 2>/dev/null || true'\'' EXIT
-for ((i=0;i<450;i++)); do
+for ((i=0;i<1200;i++)); do
     if [ -f "$DIKTATE_TEST_ARTIFACTS/shell.json" ]; then
         cat "$DIKTATE_TEST_ARTIFACTS/shell.json"
         cat "$DIKTATE_TEST_ARTIFACTS/client.json"
@@ -54,5 +58,6 @@ cat "$DIKTATE_TEST_ARTIFACTS/client.log"
 exit 1
 ' 2> "$DIKTATE_TEST_ARTIFACTS/bus.log"
 test_result=$?
-rm -rf -- "$test_root"
+# Session helpers may still be writing their state for a moment after the bus closes.
+rm -rf -- "$test_root" 2>/dev/null || { sleep 1; rm -rf -- "$test_root"; }
 exit "$test_result"

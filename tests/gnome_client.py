@@ -1,6 +1,7 @@
 """Fake recorder + real Wayland text field for the isolated GNOME smoke test."""
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -9,6 +10,17 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gio, GLib
 
+if sys.argv[1:2] == ["--fake-raster-window"]:
+    # Without a GtkApplication, GTK uses the program name as Wayland app id: like the Raster window.
+    GLib.set_prgname("raster-terminal")
+    from gi.repository import Gtk
+    window = Gtk.Window(title="Fake Raster", default_width=500, default_height=300)
+    window.set_child(Gtk.TextView())
+    window.connect("close-request", lambda _window: os._exit(0))
+    window.present()
+    GLib.timeout_add_seconds(120, lambda: os._exit(0))
+    GLib.MainLoop().run()
+
 from diktate.service import BUS_NAME, INTERFACE, INTROSPECTION, OBJECT_PATH
 
 artifacts = Path(sys.argv[1])
@@ -16,6 +28,7 @@ state = "idle"
 connection = None
 buffer = None
 application = None
+other_buffer = None
 clipboard_text = None
 toggle_count = 0
 capture_ready = False
@@ -40,6 +53,17 @@ def call(conn, sender, path, interface, method, args, invocation):
             except Exception as error:
                 invocation.return_dbus_error('io.github.diktate.TestError', str(error))
         clipboard.read_texture_async(None, texture_ready)
+        return
+    if method == "TestOpenWindows":
+        global other_buffer
+        window = Gtk.ApplicationWindow(application=application, title="Diktate other window", default_width=400, default_height=200)
+        view = Gtk.TextView()
+        other_buffer = view.get_buffer()
+        window.set_child(view)
+        window.present()
+        view.grab_focus()
+        subprocess.Popen([sys.executable, __file__, "--fake-raster-window"])
+        invocation.return_value(None)
         return
     if method == "GetState":
         invocation.return_value(GLib.Variant("(ss)", (state, "streaming" if state != "idle" else "")))
@@ -83,7 +107,9 @@ def call(conn, sender, path, interface, method, args, invocation):
                 invocation.return_value(None)
                 return
             emit("Interim", "Hallo Welt.")
-            GLib.timeout_add(200, lambda: emit("Final", "Hallo Welt.") or GLib.SOURCE_REMOVE)
+            # Starts 5 and 10 leave time to click into another window before the first words arrive.
+            delay = 1200 if toggle_count in (5, 10) else 200
+            GLib.timeout_add(delay, lambda: emit("Final", "Hallo Welt.") or GLib.SOURCE_REMOVE)
         else:
             state = "finishing"
             emit("StateChanged", state, "streaming")
@@ -112,7 +138,7 @@ def acquired(conn, name):
     global connection
     connection = conn
     node = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION.replace('</interface>',
-        '<method name="TestScreenshotClipboard"/></interface>'))
+        '<method name="TestScreenshotClipboard"/><method name="TestOpenWindows"/></interface>'))
     connection.register_object(OBJECT_PATH, node.interfaces[0], call, None, None)
 
 
@@ -164,7 +190,8 @@ def check():
     expected = "Hallo Welt. Noch ein Satz."
     start, end = buffer.get_bounds()
     text = buffer.get_text(start, end, True)
-    (artifacts / "client-state.json").write_text(json.dumps({"text": text, "toggles": toggle_count}))
+    other = other_buffer.get_text(*other_buffer.get_bounds(), True) if other_buffer else ""
+    (artifacts / "client-state.json").write_text(json.dumps({"text": text, "other": other, "toggles": toggle_count}))
     if text != expected:
         return GLib.SOURCE_CONTINUE
 
@@ -183,6 +210,6 @@ def check():
 
 
 GLib.timeout_add(100, start_app)
-GLib.timeout_add_seconds(45, lambda: loop.quit() or GLib.SOURCE_REMOVE)
+GLib.timeout_add_seconds(120, lambda: loop.quit() or GLib.SOURCE_REMOVE)
 loop.run()
 Gio.bus_unown_name(owner)
